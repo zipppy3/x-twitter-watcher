@@ -110,17 +110,16 @@ You can bypass the prompt by passing `--minimal` or `--interactive` directly.
 
 ## 🔁 Automated Token Refresh (Local Machines Only)
 
-Twitter actively expires session cookies. This repository includes `refresh_tokens.py`, which uses Playwright to maintain a persistent browser profile.
+Twitter actively expires session cookies. This repository includes `refresh_tokens.js`, which uses Playwright to maintain a persistent browser profile entirely within Node.js.
 
 **First-time setup:**
 ```bash
-pip install playwright
-python -m playwright install chromium
-python refresh_tokens.py --setup
+npx playwright install chromium
+node refresh_tokens.js --setup
 ```
 *A visible browser will open. Log in to Twitter manually and close the browser. Your profile is saved in `.browser-profile/`.*
 
-Now, whenever `watcher-core.js` detects a `401 Unauthorized` HTTP error, it will automatically run the Python script completely headless, fetch fresh cookies, and keep recording.
+Now, whenever `watcher-core.js` detects a `401 Unauthorized` HTTP error, it will automatically run the javascript headless, fetch fresh cookies, and keep recording.
 
 > **Note for Headless ARM Servers (e.g., Raspberry Pi, cheap VPS):** Playwright often fails to install Chrome binaries on ARM Linux. If you deploy there, rely on Telegram notifications to tell you when tokens expire, and run `node watcher.js update-tokens` to manually paste new ones.
 

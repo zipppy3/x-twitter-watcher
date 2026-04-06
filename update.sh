@@ -31,15 +31,9 @@ else
   echo "[2/4] SpaceDownloader.js not found, skipping patch"
 fi
 
-# 3. Update pip packages (for refresh_tokens.py)
-echo "[3/4] Updating Python packages..."
-if command -v pip3 &> /dev/null; then
-  pip3 install --upgrade playwright 2>&1 || true
-elif command -v pip &> /dev/null; then
-  pip install --upgrade playwright 2>&1 || true
-else
-  echo "  → pip not found, skipping Python updates"
-fi
+# 3. Update Playwright browsers (if needed)
+echo "[3/4] Updating browsers..."
+npx playwright install chromium 2>&1 || true
 
 # 4. Restart PM2 process if running
 echo "[4/4] Restarting watcher..."

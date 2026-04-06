@@ -376,56 +376,37 @@ const MAX_REFRESH_ATTEMPTS = 2;
 const REFRESH_RETRY_DELAY_MS = 30 * 60 * 1000;
 
 async function refreshTokens() {
-  const scriptPath = path.join(__dirname, 'refresh_tokens.py');
+  const scriptPath = path.join(__dirname, 'refresh_tokens.js');
   if (!fs.existsSync(scriptPath)) {
-    print.error('refresh_tokens.py not found!');
+    print.error('refresh_tokens.js not found!');
     return false;
   }
 
   print.warn('Attempting to refresh tokens...');
 
   return new Promise((resolve) => {
-    const py = spawn('python3', [scriptPath], {
+    const child = spawn('node', [scriptPath], {
       cwd: __dirname,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';
-    py.stdout.on('data', (d) => { stdout += d.toString(); });
-    py.stderr.on('data', () => {});
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', () => {});
 
-    py.on('close', (code) => {
+    child.on('close', (code) => {
       if (code === 0 && stdout.includes('SUCCESS')) {
         dotenv.config({ path: opts.env, override: true });
         print.success('Tokens refreshed successfully!');
         tokenRefreshAttempts = 0;
         resolve(true);
       } else {
-        print.error('Token refresh failed.');
+        print.error('Token refresh failed. Try running: node refresh_tokens.js --setup');
         resolve(false);
       }
     });
 
-    py.on('error', () => {
-      // Fallback: try 'python' instead of 'python3'
-      const py2 = spawn('python', [scriptPath], {
-        cwd: __dirname,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout2 = '';
-      py2.stdout.on('data', (d) => { stdout2 += d.toString(); });
-      py2.on('close', (code2) => {
-        if (code2 === 0 && stdout2.includes('SUCCESS')) {
-          dotenv.config({ path: opts.env, override: true });
-          print.success('Tokens refreshed successfully!');
-          tokenRefreshAttempts = 0;
-          resolve(true);
-        } else {
-          resolve(false);
-        }
-      });
-      py2.on('error', () => resolve(false));
-    });
+    child.on('error', () => resolve(false));
   });
 }
 
