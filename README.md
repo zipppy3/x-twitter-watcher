@@ -17,7 +17,7 @@ A robust, 24/7 automated monitoring and recording daemon for Twitter / X Spaces.
 * **Interactive Mode:** A beautifully formatted, colorful CLI for local desktop monitoring with live timers and status indicators.
 * **Telegram Notifications:** Get instantly pinged when a mapped user goes live, when a recording completes, or if your session expires.
 * **Smart File Management:** No more cluttered `.json` dumps. Saves a pristine `.m4a` audio file named after the Space title, alongside a clean `.txt` file containing the host, duration, and a list of speakers.
-* **Auto-Refreshing Tokens:** Includes a Playwright-powered Python script to automatically launch a browser profile, extract fresh cookies, and update your configuration if your Twitter session drops.
+* **Auto-Refreshing Tokens:** Includes a Playwright-powered script to automatically launch a browser profile, extract fresh cookies, and update your configuration if your Twitter session drops.
 * **Fast Downloads:** Patched specifically to increase concurrent audio chunk downloads (400% faster processing when a Space ends).
 
 ---
@@ -27,11 +27,11 @@ A robust, 24/7 automated monitoring and recording daemon for Twitter / X Spaces.
 ### Prerequisites
 1. **Node.js** (v18 or higher)
 2. **FFmpeg** (must be installed and accessible in your system `PATH`)
-3. **Python 3** and `pip` (only required if you want token auto-refresh)
+3. **Docker** (optional — only needed to bypass Telegram's 50MB upload limit)
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/x-space-watcher.git
+git clone https://github.com/zipppy3/x-space-watcher.git
 cd x-space-watcher
 npm install
 ```
@@ -70,15 +70,19 @@ During `node watcher.js setup`, you can provide a Telegram Bot Token and your Ch
 If you are using a Telegram Group, you can also provide **Topic Thread IDs** to automatically upload the finished `.m4a` audio to one topic, and the `.txt` speakers metadata to another.
 
 #### ⚠️ Bypassing Telegram's 50MB File Limit
-The public Telegram Bot API rejects files larger than 50MB (which prevents 2+ hour Spaces from uploading). To bypass this and upload up to **2 GB**, run a [Local Bot API Server](https://github.com/tdlib/telegram-bot-api) directly on your Ubuntu machine:
+The public Telegram Bot API rejects files larger than 50MB (which prevents 2+ hour Spaces from uploading). To bypass this and upload up to **2 GB**, a `docker-compose.yml` is included that runs a [Local Bot API Server](https://github.com/tdlib/telegram-bot-api) using the [`aiogram/telegram-bot-api`](https://hub.docker.com/r/aiogram/telegram-bot-api) Docker image.
 
-1. Go to `my.telegram.org` and get your `API_ID` and `API_HASH`.
-2. Install the Official Telegram Bot API Server on your Ubuntu server.
-3. Start it using PM2 to run alongside the watcher:
-   ```bash
-   pm2 start telegram-bot-api --name "tg-api" -- --api-id=YOUR_ID --api-hash=YOUR_HASH --local
+1. Go to [`my.telegram.org`](https://my.telegram.org) and get your `API_ID` and `API_HASH`.
+2. Add them to your `.env` file:
+   ```env
+   TELEGRAM_API_ID=12345
+   TELEGRAM_API_HASH=abcdef1234567890
    ```
-4. Run `node watcher.js setup` and set your `Local Bot API URL` to `http://127.0.0.1:8081`. The watcher will automatically start routing file uploads through your local server, bypassing the cloud limit!
+3. Start the local server:
+   ```bash
+   docker compose up -d
+   ```
+That's it! The watcher automatically routes file uploads through `http://127.0.0.1:8081`, bypassing the 50MB cloud limit entirely.
 
 ---
 

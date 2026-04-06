@@ -436,9 +436,21 @@ async function cmdSetup() {
     const metaId = await ask(`  Metadata Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
     if (metaId) writeEnvKey('TELEGRAM_METADATA_THREAD_ID', metaId);
 
-    console.log(c.gray('\n  To bypass the 50MB file limit, you must run a Local Bot API Server.'));
-    const apiUrl = await ask(`  Local Bot API URL ${c.gray('(press Enter for default)')}: `);
-    if (apiUrl) writeEnvKey('TELEGRAM_API_URL', apiUrl);
+    console.log(c.cyan('\n  ── 50MB Upload Bypass (Docker) ─────────────'));
+    console.log(c.gray('  To upload large files, we run a Local Telegram Bot API Server via Docker.'));
+    console.log(c.gray('  Get your API ID and Hash from https://my.telegram.org\n'));
+
+    const apiId = await ask(`  API ID ${c.gray('(press Enter to skip)')}: `);
+    if (apiId) writeEnvKey('TELEGRAM_API_ID', apiId);
+
+    const apiHash = await ask(`  API Hash ${c.gray('(press Enter to skip)')}: `);
+    if (apiHash) writeEnvKey('TELEGRAM_API_HASH', apiHash);
+
+    if (apiId && apiHash) {
+      writeEnvKey('TELEGRAM_API_URL', 'http://127.0.0.1:8081');
+      console.log(c.gray('\n  To start the local server, run:'));
+      console.log(c.bold('    docker compose up -d\n'));
+    }
   }
 
   // Test Telegram
