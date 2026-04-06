@@ -1,0 +1,22 @@
+{
+  "name": "space-watcher",
+  "version": "2.0.0",
+  "description": "Twitter Spaces 24/7 Watcher & Recorder",
+  "main": "watcher.js",
+  "scripts": {
+    "start": "node watcher.js start",
+    "stop": "node watcher.js stop",
+    "status": "node watcher.js status",
+    "setup": "node watcher.js setup"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^13.1.0",
+    "dotenv": "^17.4.0",
+    "twspace-crawler": "^1.18.1"
+  }
+}

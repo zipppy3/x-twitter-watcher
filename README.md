@@ -1,0 +1,130 @@
+<div align="center">
+
+# X Space Watcher
+
+![Version](https://img.shields.io/badge/version-2.0-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+
+A robust, 24/7 automated monitoring and recording daemon for Twitter / X Spaces. Designed for both personal desktop use and headless server deployments.
+
+</div>
+
+---
+
+## 🚀 Features
+
+* **Headless Daemon Mode:** Runs flawlessly in the background on bare-metal servers (Ubuntu/Debian) via PM2. Survives terminal closures and system reboots.
+* **Interactive Mode:** A beautifully formatted, colorful CLI for local desktop monitoring with live timers and status indicators.
+* **Telegram Notifications:** Get instantly pinged when a mapped user goes live, when a recording completes, or if your session expires.
+* **Smart File Management:** No more cluttered `.json` dumps. Saves a pristine `.m4a` audio file named after the Space title, alongside a clean `.txt` file containing the host, duration, and a list of speakers.
+* **Auto-Refreshing Tokens:** Includes a Playwright-powered Python script to automatically launch a browser profile, extract fresh cookies, and update your configuration if your Twitter session drops.
+* **Fast Downloads:** Patched specifically to increase concurrent audio chunk downloads (400% faster processing when a Space ends).
+
+---
+
+## 🛠️ Installation
+
+### Prerequisites
+1. **Node.js** (v18 or higher)
+2. **FFmpeg** (must be installed and accessible in your system `PATH`)
+3. **Python 3** and `pip` (only required if you want token auto-refresh)
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/YOUR_USERNAME/x-space-watcher.git
+cd x-space-watcher
+npm install
+```
+
+### 2. Global Dependencies (For server deployments)
+If you want to run this in the background 24/7, install PM2:
+```bash
+npm install -g pm2
+pm2 startup
+```
+
+---
+
+## ⚙️ Configuration
+
+Copy the example environment file:
+```bash
+cp .env.example .env
+```
+
+### Twitter Authentication
+To download Spaces, you need active session cookies from an authenticated Twitter account.
+1. Open your browser and log in to X.com.
+2. Open Developer Tools (F12) -> Application (or Storage) -> Cookies.
+3. Find the `auth_token` and `ct0` values.
+4. Run the setup wizard to securely inject them:
+```bash
+node watcher.js setup
+```
+
+*(Alternatively, paste them directly into your `.env` file).*
+
+### Telegram Notifications (Optional)
+During `node watcher.js setup`, you can provide a Telegram Bot Token and your Chat ID to enable push notifications to your phone.
+
+---
+
+## 💻 Usage
+
+The `watcher.js` CLI controls the entire application. 
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `node watcher.js start --user <username>` | Stars watching a comma-separated list of usernames |
+| `node watcher.js start --id <space_id>` | Immediately downloads a specific active or recorded Space by ID |
+| `node watcher.js stop` | Safely stops the background daemon |
+| `node watcher.js status` | Shows a clean overview of monitor status, uptime, and recent recordings |
+| `node watcher.js switch` | Instantly swaps the watcher between Background PM2 and Foreground Interactive modes |
+| `node watcher.js logs` | Live-tails the PM2 logs if running in the background |
+| `node watcher.js setup` | Launches the interactive configuration wizard |
+
+### Running 24/7
+
+When you run `node watcher.js start --user elonmusk`, the CLI will ask you to choose a mode:
+1. **Minimalistic**: Disables all terminal colors and UI, hands the process to PM2, and runs silently in the background forever.
+2. **Interactive**: Boots up exactly where you are, with colorful live timers and polling indicators.
+
+You can bypass the prompt by passing `--minimal` or `--interactive` directly.
+
+---
+
+## 🔁 Automated Token Refresh (Local Machines Only)
+
+Twitter actively expires session cookies. This repository includes `refresh_tokens.py`, which uses Playwright to maintain a persistent browser profile.
+
+**First-time setup:**
+```bash
+pip install playwright
+python -m playwright install chromium
+python refresh_tokens.py --setup
+```
+*A visible browser will open. Log in to Twitter manually and close the browser. Your profile is saved in `.browser-profile/`.*
+
+Now, whenever `watcher-core.js` detects a `401 Unauthorized` HTTP error, it will automatically run the Python script completely headless, fetch fresh cookies, and keep recording.
+
+> **Note for Headless ARM Servers (e.g., Raspberry Pi, cheap VPS):** Playwright often fails to install Chrome binaries on ARM Linux. If you deploy there, rely on Telegram notifications to tell you when tokens expire, and run `node watcher.js update-tokens` to manually paste new ones.
+
+---
+
+## 📅 Monthly Auto-Update (Ubuntu/Linux)
+
+Twitter frequently changes their internal API, which breaks open-source tools. This tool relies on the brilliant `twspace-crawler` library under the hood. To ensure you always have the latest fixes, set up the provided cron job:
+
+```bash
+chmod +x update.sh
+crontab -e
+```
+Add this line to run the update on the 1st of every month at 3:00 AM:
+`0 3 1 * * /path/to/x-space-watcher/update.sh >> /path/to/x-space-watcher/update.log 2>&1`
+
+---
+
+## ⚖️ License
+This project is open-sourced under the MIT License. See `LICENSE` for details.
