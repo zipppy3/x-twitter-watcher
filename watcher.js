@@ -428,6 +428,18 @@ async function cmdSetup() {
 
   const chatId = await ask(`  Chat ID ${c.gray('(press Enter to skip)')}: `);
   if (chatId) writeEnvKey('TELEGRAM_CHAT_ID', chatId);
+  
+  if (botToken && chatId) {
+    const audioId = await ask(`  Audio Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
+    if (audioId) writeEnvKey('TELEGRAM_AUDIO_THREAD_ID', audioId);
+
+    const metaId = await ask(`  Metadata Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
+    if (metaId) writeEnvKey('TELEGRAM_METADATA_THREAD_ID', metaId);
+
+    console.log(c.gray('\n  To bypass the 50MB file limit, you must run a Local Bot API Server.'));
+    const apiUrl = await ask(`  Local Bot API URL ${c.gray('(press Enter for default)')}: `);
+    if (apiUrl) writeEnvKey('TELEGRAM_API_URL', apiUrl);
+  }
 
   // Test Telegram
   if (botToken && chatId) {

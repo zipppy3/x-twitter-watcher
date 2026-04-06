@@ -318,7 +318,25 @@ SpaceWatcher.prototype.downloadAudio = async function () {
       `Host: @${user}\n` +
       `Duration: ${duration}\n` +
       `File: ${path.basename(this.downloader.resultFile)}`
-    );
+    ).then(() => {
+      // Trigger background upload to Topics
+      const { uploadTelegramAudio, uploadTelegramDocument } = require('./notify');
+      
+      const durationSec = (this.space?.endedAt && this.space?.startedAt)
+        ? Math.floor((Number(this.space.endedAt) - this.space.startedAt) / 1000)
+        : 0;
+        
+      const dir = Util.getMediaDir(user);
+      const metadataFile = path.join(dir, `${this.filename} — speakers.txt`);
+
+      uploadTelegramAudio(this.downloader.resultFile, title, user, durationSec)
+        .then((ok) => { if (ok) print.success('Audio uploaded to Telegram Topic'); });
+        
+      if (fs.existsSync(metadataFile)) {
+        uploadTelegramDocument(metadataFile)
+          .then((ok) => { if (ok) print.success('Metadata uploaded to Telegram Topic'); });
+      }
+    });
   }
 };
 

@@ -64,8 +64,21 @@ node watcher.js setup
 
 *(Alternatively, paste them directly into your `.env` file).*
 
-### Telegram Notifications (Optional)
+### Telegram Notifications & Auto-Uploads (Optional)
 During `node watcher.js setup`, you can provide a Telegram Bot Token and your Chat ID to enable push notifications to your phone.
+
+If you are using a Telegram Group, you can also provide **Topic Thread IDs** to automatically upload the finished `.m4a` audio to one topic, and the `.txt` speakers metadata to another.
+
+#### ⚠️ Bypassing Telegram's 50MB File Limit
+The public Telegram Bot API rejects files larger than 50MB (which prevents 2+ hour Spaces from uploading). To bypass this and upload up to **2 GB**, run a [Local Bot API Server](https://github.com/tdlib/telegram-bot-api) directly on your Ubuntu machine:
+
+1. Go to `my.telegram.org` and get your `API_ID` and `API_HASH`.
+2. Install the Official Telegram Bot API Server on your Ubuntu server.
+3. Start it using PM2 to run alongside the watcher:
+   ```bash
+   pm2 start telegram-bot-api --name "tg-api" -- --api-id=YOUR_ID --api-hash=YOUR_HASH --local
+   ```
+4. Run `node watcher.js setup` and set your `Local Bot API URL` to `http://127.0.0.1:8081`. The watcher will automatically start routing file uploads through your local server, bypassing the cloud limit!
 
 ---
 
