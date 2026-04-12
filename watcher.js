@@ -97,7 +97,7 @@ function timeAgo(isoString) {
 
 function banner() {
   console.log(c.cyanBold('\n  ╔══════════════════════════════════════╗'));
-  console.log(c.cyanBold('  ║   Twitter Spaces Watcher  v2.0      ║'));
+  console.log(c.cyanBold('  ║     X Watcher  v3.0                 ║'));
   console.log(c.cyanBold('  ╚══════════════════════════════════════╝\n'));
 }
 
@@ -243,7 +243,7 @@ function cmdStatus() {
 
   console.log();
   console.log('  ┌───────────────────────────────────────────┐');
-  console.log('  │  ' + c.bold('Twitter Spaces Watcher') + '                    │');
+  console.log('  │  ' + c.bold('X Watcher v3.0      ') + '                    │');
   console.log('  ├───────────────────────────────────────────┤');
 
   if (!state && !pm2Running) {
@@ -265,11 +265,14 @@ function cmdStatus() {
   }
 
   const mode = state?.mode === 'minimal' ? 'Minimalistic' : 'Interactive';
-  const users = (state?.users || []).map(u => '@' + u).join(', ') || '—';
+  const allUsersCount = (state?.users || []).length;
+  const spaceUsersCount = (state?.spaceUsers || []).length;
+  const tweetUsersCount = (state?.tweetUsers || []).length;
   const uptime = state?.startedAt ? timeAgo(state.startedAt) : '—';
   const lastPoll = state?.lastPoll ? timeAgo(state.lastPoll) : '—';
   const checks = state?.pollCount || 0;
   const recordings = (state?.recordings || []).length;
+  const seenTweets = state?.totalSeenTweets || 0;
 
   const pad = (label, value, width = 41) => {
     const line = `  │  ${label}${value}`;
@@ -285,11 +288,17 @@ function cmdStatus() {
   }
 
   console.log(pad('Mode:       ', mode));
-  console.log(pad('Users:      ', users));
+  console.log(pad('Users:      ', `${allUsersCount} total`));
   console.log(pad('Started:    ', uptime));
-  console.log(pad('Last poll:  ', lastPoll));
-  console.log(pad('Checks:     ', String(checks)));
-  console.log(pad('Recordings: ', `${recordings} total`));
+
+  console.log('  ├───────────────────────────────────────────┤');
+  console.log(pad('🎙 Spaces:   ', `${spaceUsersCount} watched`));
+  console.log(pad('  Polls:    ', String(checks)));
+  console.log(pad('  Recorded: ', `${recordings} total`));
+
+  console.log('  ├───────────────────────────────────────────┤');
+  console.log(pad('📝 Tweets:   ', `${tweetUsersCount} watched`));
+  console.log(pad('  Captured: ', `${seenTweets} total`));
 
   // Show active spaces
   if (state?.activeSpaces?.length) {
