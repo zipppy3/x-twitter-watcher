@@ -429,21 +429,29 @@ async function cmdSetup() {
   // 2. Telegram
   console.log(c.cyan('\n  ── Telegram Notifications ──────────────────'));
   console.log(c.gray('  1. Message @BotFather on Telegram → /newbot'));
-  console.log(c.gray('  2. Send any message to your new bot'));
-  console.log(c.gray('  3. Visit: https://api.telegram.org/bot<TOKEN>/getUpdates\n'));
+  console.log(c.gray('  2. Add the bot to your group'));
+  console.log(c.gray('  3. Send a message in the group'));
+  console.log(c.gray('  4. Visit: https://api.telegram.org/bot<TOKEN>/getUpdates'));
+  console.log(c.gray('  5. Look for "chat":{"id": ... }  (should start with -100 for groups)\n'));
 
   const botToken = await ask(`  Bot token ${c.gray('(press Enter to skip)')}: `);
   if (botToken) writeEnvKey('TELEGRAM_BOT_TOKEN', botToken);
 
-  const chatId = await ask(`  Chat ID ${c.gray('(press Enter to skip)')}: `);
+  const chatId = await ask(`  Chat ID ${c.gray('(starts with -100 for groups)')}: `);
   if (chatId) writeEnvKey('TELEGRAM_CHAT_ID', chatId);
   
   if (botToken && chatId) {
+    console.log(c.cyan('\n  ── Topic Thread IDs ────────────────────────'));
+    console.log(c.gray('  These route uploads to specific Topics in your group.\n'));
+
     const audioId = await ask(`  Audio Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
     if (audioId) writeEnvKey('TELEGRAM_AUDIO_THREAD_ID', audioId);
 
     const metaId = await ask(`  Metadata Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
     if (metaId) writeEnvKey('TELEGRAM_METADATA_THREAD_ID', metaId);
+
+    const tweetId = await ask(`  Tweet Screenshot Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
+    if (tweetId) writeEnvKey('TELEGRAM_TWEET_THREAD_ID', tweetId);
 
     console.log(c.cyan('\n  ── 50MB Upload Bypass (Docker) ─────────────'));
     console.log(c.gray('  To upload large files, we run a Local Telegram Bot API Server via Docker.'));

@@ -3,13 +3,36 @@
 /**
  * Twitter API — Lightweight GraphQL wrapper for tweet fetching.
  * 
- * Reuses the same auth_token + ct0 cookie pattern as twspace-crawler,
- * so it works with the existing .env configuration.
+ * Uses the same endpoint hashes, params, and auth patterns as twspace-crawler
+ * to stay in sync with Twitter's API changes.
  */
 
 const axios = require('axios');
 
-const BEARER = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+// Import the up-to-date constants directly from twspace-crawler
+const { TWITTER_PUBLIC_AUTHORIZATION, UA } = require('twspace-crawler/dist/api/twitter.constant');
+const { twitterGraphqlEndpoints } = require('twspace-crawler/dist/api/constant/twitter-graphql-endpoint.constant');
+const { twitterGraphqlParams } = require('twspace-crawler/dist/api/constant/twitter-graphql-param.constant');
+
+const TWITTER_API_URL = 'https://api.twitter.com';
+
+/**
+ * Clone and merge params (mirrors twspace-crawler's cloneParams method).
+ * Each top-level key (variables, features, fieldToggles) is JSON-stringified.
+ */
+function cloneParams(src, overrides) {
+  const obj = JSON.parse(JSON.stringify(src));
+  if (overrides) {
+    Object.keys(overrides).forEach((key) => {
+      Object.assign(obj, { [key]: { ...obj[key], ...overrides[key] } });
+    });
+  }
+  // Twitter expects each param group as a JSON string
+  Object.keys(obj).forEach((key) => {
+    obj[key] = JSON.stringify(obj[key]);
+  });
+  return obj;
+}
 
 /**
  * Build authentication headers using the same cookies from .env
@@ -21,12 +44,20 @@ function getAuthHeaders() {
   if (!authToken || !csrfToken) return null;
 
   return {
-    authorization: BEARER,
+    authorization: TWITTER_PUBLIC_AUTHORIZATION,
     cookie: `auth_token=${authToken}; ct0=${csrfToken}`,
     'x-csrf-token': csrfToken,
     'x-twitter-active-user': 'yes',
     'x-twitter-client-language': 'en',
+    'user-agent': UA,
   };
+}
+
+/**
+ * Build the full URL for a GraphQL endpoint.
+ */
+function buildUrl(endpoint) {
+  return `${TWITTER_API_URL}/graphql/${endpoint.queryId}/${endpoint.operationName}`;
 }
 
 /**
@@ -38,26 +69,12 @@ async function getUserId(username) {
   if (!headers) return null;
 
   try {
-    const { data } = await axios.get(
-      'https://twitter.com/i/api/graphql/7mjxD3-C6BxitPMVQ6w0-Q/UserByScreenName',
-      {
-        headers,
-        params: {
-          variables: JSON.stringify({
-            screen_name: username,
-            withSafetyModeUserFields: false,
-            withSuperFollowsUserFields: false,
-          }),
-          features: JSON.stringify({
-            hidden_profile_subscriptions_enabled: true,
-            responsive_web_graphql_exclude_directive_enabled: true,
-            verified_phone_label_enabled: false,
-            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-            responsive_web_graphql_timeline_navigation_enabled: true,
-          }),
-        },
-      }
-    );
+    const url = buildUrl(twitterGraphqlEndpoints.UserByScreenName);
+    const params = cloneParams(twitterGraphqlParams.UserByScreenName, {
+      variables: { screen_name: username },
+    });
+
+    const { data } = await axios.get(url, { headers, params });
     return data?.data?.user?.result?.rest_id || null;
   } catch (err) {
     console.error(`[TwitterAPI] getUserId error for @${username}:`, err.message);
@@ -76,46 +93,15 @@ async function getUserTweets(userId, count = 20) {
   if (!headers) return [];
 
   try {
-    const { data } = await axios.get(
-      'https://twitter.com/i/api/graphql/QvCV3AU7X1ZXr9JSrH9EOA/UserTweets',
-      {
-        headers,
-        params: {
-          variables: JSON.stringify({
-            userId,
-            count,
-            includePromotedContent: false,
-            withQuickPromoteEligibilityTweetFields: false,
-            withVoice: false,
-            withV2Timeline: true,
-          }),
-          features: JSON.stringify({
-            responsive_web_graphql_exclude_directive_enabled: true,
-            verified_phone_label_enabled: false,
-            responsive_web_graphql_timeline_navigation_enabled: true,
-            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-            creator_subscriptions_tweet_preview_api_enabled: true,
-            tweetypie_unmention_optimization_enabled: true,
-            responsive_web_edit_tweet_api_enabled: true,
-            graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-            view_counts_everywhere_api_enabled: true,
-            longform_notetweets_consumption_enabled: true,
-            responsive_web_twitter_article_tweet_consumption_enabled: true,
-            tweet_awards_web_tipping_enabled: false,
-            freedom_of_speech_not_reach_fetch_enabled: true,
-            standardized_nudges_misinfo: true,
-            longform_notetweets_rich_text_read_enabled: true,
-            responsive_web_enhance_cards_enabled: false,
-            rweb_video_timestamps_enabled: true,
-            tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-          }),
-        },
-      }
-    );
+    const url = buildUrl(twitterGraphqlEndpoints.UserTweets);
+    const params = cloneParams(twitterGraphqlParams.UserTweets, {
+      variables: { userId, count },
+    });
 
+    const { data } = await axios.get(url, { headers, params });
     return parseTweetsResponse(data);
   } catch (err) {
-    console.error(`[TwitterAPI] getUserTweets error:`, err.message);
+    console.error(`[TwitterAPI] getUserTweets error:`, err.response?.status, err.message);
     return [];
   }
 }
@@ -130,41 +116,12 @@ async function getTweetById(tweetId) {
   if (!headers) return null;
 
   try {
-    const { data } = await axios.get(
-      'https://twitter.com/i/api/graphql/xOhkmRac04YFZmOzU9PJHg/TweetDetail',
-      {
-        headers,
-        params: {
-          variables: JSON.stringify({
-            focalTweetId: tweetId,
-            with_rux_injections: false,
-            includePromotedContent: false,
-            withCommunity: true,
-            withQuickPromoteEligibilityTweetFields: false,
-            withBirdwatchNotes: false,
-            withVoice: true,
-            withV2Timeline: true,
-          }),
-          features: JSON.stringify({
-            responsive_web_graphql_exclude_directive_enabled: true,
-            verified_phone_label_enabled: false,
-            responsive_web_graphql_timeline_navigation_enabled: true,
-            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-            tweetypie_unmention_optimization_enabled: true,
-            responsive_web_edit_tweet_api_enabled: true,
-            graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-            view_counts_everywhere_api_enabled: true,
-            longform_notetweets_consumption_enabled: true,
-            tweet_awards_web_tipping_enabled: false,
-            freedom_of_speech_not_reach_fetch_enabled: true,
-            standardized_nudges_misinfo: true,
-            longform_notetweets_rich_text_read_enabled: true,
-            responsive_web_enhance_cards_enabled: false,
-            tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-          }),
-        },
-      }
-    );
+    const url = buildUrl(twitterGraphqlEndpoints.TweetDetail);
+    const params = cloneParams(twitterGraphqlParams.TweetDetail, {
+      variables: { focalTweetId: tweetId },
+    });
+
+    const { data } = await axios.get(url, { headers, params });
 
     // TweetDetail returns entries in a timeline format
     const instructions = data?.data?.threaded_conversation_with_injections_v2?.instructions || [];
@@ -227,7 +184,6 @@ function parseSingleTweet(result) {
 
   const legacy = result.legacy;
   const user = result.core?.user_results?.result?.legacy || {};
-  const metrics = legacy;
 
   // Extract media
   const media = (legacy.extended_entities?.media || []).map(m => ({
@@ -258,10 +214,10 @@ function parseSingleTweet(result) {
       profileImage: user.profile_image_url_https,
     },
     metrics: {
-      likes: metrics.favorite_count || 0,
-      retweets: metrics.retweet_count || 0,
-      replies: metrics.reply_count || 0,
-      bookmarks: metrics.bookmark_count || 0,
+      likes: legacy.favorite_count || 0,
+      retweets: legacy.retweet_count || 0,
+      replies: legacy.reply_count || 0,
+      bookmarks: legacy.bookmark_count || 0,
       views: result.views?.count ? parseInt(result.views.count) : 0,
     },
     conversationId: legacy.conversation_id_str,

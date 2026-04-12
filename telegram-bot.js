@@ -46,8 +46,14 @@ function startTelegramBot(options = {}) {
 
     // ── Security: only respond to authorized chat ──
     bot.on('message', (msg) => {
-      if (String(msg.chat.id) !== String(chatId)) {
-        bot.sendMessage(msg.chat.id, '⛔ Unauthorized. This bot only responds to its configured chat.');
+      const incomingChatId = String(msg.chat.id);
+      
+      // Check if this is the authorized chat
+      if (incomingChatId !== String(chatId)) {
+        // Log the mismatch to help user find their correct chat ID
+        console.log(`[TelegramBot] Message from unauthorized chat: ${incomingChatId} (configured: ${chatId})`);
+        console.log(`[TelegramBot] If this is your group, update TELEGRAM_CHAT_ID=${incomingChatId} in .env`);
+        // Don't reply to avoid "supergroup upgraded" errors
         return;
       }
 
@@ -80,11 +86,18 @@ function startTelegramBot(options = {}) {
 
     // Handle polling errors silently
     bot.on('polling_error', (err) => {
-      if (err.code === 'ETELEGRAM' && err.message?.includes('409')) {
+      const errMsg = err.message || '';
+      if (err.code === 'ETELEGRAM' && errMsg.includes('409')) {
         // Another bot instance is running, ignore
         return;
       }
-      console.error('[TelegramBot] Polling error:', err.message);
+      if (errMsg.includes('upgraded to a supergroup')) {
+        // Chat was migrated — the chat ID changed
+        console.error('[TelegramBot] Your group was upgraded to a supergroup. Your TELEGRAM_CHAT_ID needs updating.');
+        console.error('[TelegramBot] Visit https://api.telegram.org/bot' + botToken + '/getUpdates to find the new ID');
+        return;
+      }
+      console.error('[TelegramBot] Polling error:', errMsg);
     });
 
   } catch (err) {
