@@ -1,7 +1,7 @@
 {
   "name": "space-watcher",
-  "version": "2.0.0",
-  "description": "Twitter Spaces 24/7 Watcher & Recorder",
+  "version": "3.0.0",
+  "description": "Twitter/X 24/7 Watcher — Spaces, Tweets & Telegram Bot",
   "main": "watcher.js",
   "scripts": {
     "start": "node watcher.js start",
@@ -19,6 +19,7 @@
     "commander": "^13.1.0",
     "dotenv": "^17.4.0",
     "form-data": "^4.0.5",
+    "node-telegram-bot-api": "^0.67.0",
     "playwright": "^1.59.1",
     "twspace-crawler": "^1.18.1"
   }

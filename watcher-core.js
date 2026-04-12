@@ -7,6 +7,9 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { sendTelegram } = require('./notify');
+const watchlist = require('./watchlist-manager');
+const { startTweetWatcher, stopTweetWatcher, getTweetWatcherStatus } = require('./tweet-watcher');
+const { startTelegramBot, stopTelegramBot } = require('./telegram-bot');
 
 // ═══════════════════════════════════════════════════════════════
 //  CLI Options (must happen before requiring twspace-crawler
@@ -319,7 +322,7 @@ SpaceWatcher.prototype.downloadAudio = async function () {
       `Duration: ${duration}\n` +
       `File: ${path.basename(this.downloader.resultFile)}`
     ).then(() => {
-      // Trigger background upload to Topics
+      // Trigger background upload to Topics (with per-user routing)
       const { uploadTelegramAudio, uploadTelegramDocument } = require('./notify');
       
       const durationSec = (this.space?.endedAt && this.space?.startedAt)
@@ -329,11 +332,15 @@ SpaceWatcher.prototype.downloadAudio = async function () {
       const dir = Util.getMediaDir(user);
       const metadataFile = path.join(dir, `${this.filename} — speakers.txt`);
 
-      uploadTelegramAudio(this.downloader.resultFile, title, user, durationSec)
+      // Use per-user Topic IDs if configured
+      const audioTopicId = watchlist.getTopicId(user, 'audio');
+      const metaTopicId = watchlist.getTopicId(user, 'metadata');
+
+      uploadTelegramAudio(this.downloader.resultFile, title, user, durationSec, audioTopicId)
         .then((ok) => { if (ok) print.success('Audio uploaded to Telegram Topic'); });
         
       if (fs.existsSync(metadataFile)) {
-        uploadTelegramDocument(metadataFile)
+        uploadTelegramDocument(metadataFile, metaTopicId)
           .then((ok) => { if (ok) print.success('Metadata uploaded to Telegram Topic'); });
       }
     });
@@ -468,26 +475,37 @@ async function main() {
   if (!IS_MINIMAL) {
     const c = chalk || { cyan: { bold: (s) => s } };
     console.log(c.cyan.bold('\n  ╔══════════════════════════════════════╗'));
-    console.log(c.cyan.bold('  ║   Twitter Spaces Watcher  v2.0      ║'));
+    console.log(c.cyan.bold('  ║     X Watcher  v3.0                 ║'));
     console.log(c.cyan.bold('  ╚══════════════════════════════════════╝\n'));
   } else {
-    print.info('Twitter Spaces Watcher v2.0 started (minimal mode)');
+    print.info('X Watcher v3.0 started (minimal mode)');
   }
 
   configManager.load();
 
   const { url, id, user } = opts;
 
-  // Initialize state
-  const usernames = [...new Set((user || '')
+  // Initialize watchlist from CLI --user args (only on first run)
+  const cliUsers = [...new Set((user || '')
     .split(',')
     .concat((configManager.config.users || []).map((v) => (typeof v === 'string' ? v : v?.username)))
     .filter((v) => v))];
 
+  if (cliUsers.length) {
+    watchlist.initFromCliUsers(cliUsers);
+  }
+
+  // Get all users from the dynamic watchlist
+  const allUsers = watchlist.getUsers();
+  const spaceUsers = watchlist.getSpaceUsers();
+  const tweetUsers = watchlist.getTweetUsers();
+
   writeState({
     status: 'WATCHING',
     mode: IS_MINIMAL ? 'minimal' : 'interactive',
-    users: usernames,
+    users: allUsers,
+    spaceUsers,
+    tweetUsers,
     startedAt: new Date().toISOString(),
     pollCount: 0,
     activeSpaces: [],
@@ -496,8 +514,14 @@ async function main() {
   });
 
   // Notify start
-  if (usernames.length) {
-    sendTelegram(`🟢 <b>Watcher Started</b>\n\nMode: ${IS_MINIMAL ? 'Minimal' : 'Interactive'}\nUsers: ${usernames.map(u => '@' + u).join(', ')}`);
+  if (allUsers.length) {
+    sendTelegram(
+      `🟢 <b>X Watcher Started</b>\n\n` +
+      `Mode: ${IS_MINIMAL ? 'Minimal' : 'Interactive'}\n` +
+      `🎙 Spaces: ${spaceUsers.length} users\n` +
+      `📝 Tweets: ${tweetUsers.length} users\n` +
+      `Users: ${allUsers.map(u => '@' + u).join(', ')}`
+    );
   }
 
   // Mode 1: Download by playlist URL
@@ -515,22 +539,67 @@ async function main() {
   }
 
   // Mode 3: Watch users
-  if (!usernames.length) {
-    print.error('No users specified. Use --user <username>');
+  if (!allUsers.length) {
+    print.error('No users specified. Use --user <username> or /add via Telegram');
     process.exit(1);
   }
 
-  userManager.once('list_ready', () => {
-    mainManager.runUserListWatcher();
-  });
+  // ── Start Space Watcher ──
+  if (spaceUsers.length) {
+    userManager.once('list_ready', () => {
+      mainManager.runUserListWatcher();
+    });
 
-  await userManager.add(usernames);
+    await userManager.add(spaceUsers);
 
-  if (Util.getTwitterAuthorization() || Util.getTwitterAuthToken()) {
-    mainManager.runUserListWatcher();
-  } else {
-    usernames.forEach((u) => mainManager.addUserWatcher(u));
+    if (Util.getTwitterAuthorization() || Util.getTwitterAuthToken()) {
+      mainManager.runUserListWatcher();
+    } else {
+      spaceUsers.forEach((u) => mainManager.addUserWatcher(u));
+    }
   }
+
+  // ── Start Tweet Watcher ──
+  if (tweetUsers.length) {
+    startTweetWatcher(print.info);
+  }
+
+  // ── Start Telegram Bot ──
+  startTelegramBot({
+    getStatus: () => {
+      const state = readState();
+      const tweetStatus = getTweetWatcherStatus();
+      const uptime = state.startedAt
+        ? Math.floor((Date.now() - new Date(state.startedAt).getTime()) / 60000) + ' min'
+        : '?';
+      return {
+        state: state.status || 'UNKNOWN',
+        mode: state.mode || 'unknown',
+        uptime,
+        spaceUsers: watchlist.getSpaceUsers().length,
+        tweetUsers: tweetStatus.watchingUsers,
+        pollCount: state.pollCount || 0,
+        activeSpaces: state.activeSpaces || [],
+        totalRecordings: (state.recordings || []).length,
+        totalSeenTweets: tweetStatus.totalSeenTweets,
+      };
+    },
+    onWatchlistChange: async (action, username) => {
+      print.info(`Watchlist ${action}: @${username}`);
+      const updatedUsers = watchlist.getSpaceUsers();
+      const updatedTweetUsers = watchlist.getTweetUsers();
+      writeState({ users: watchlist.getUsers(), spaceUsers: updatedUsers, tweetUsers: updatedTweetUsers });
+
+      // Hot-reload: if a user was added, add them to the space watcher too
+      if (action === 'add') {
+        const cfg = watchlist.getUserConfig(username);
+        if (cfg?.watchSpaces !== false) {
+          try { await userManager.add([username]); } catch { /* ignore */ }
+        }
+        // Tweet watcher picks up changes automatically from watchlist.json
+      }
+    },
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -539,6 +608,10 @@ async function main() {
 function shutdown(signal) {
   print.newline();
   print.info(`Shutting down (${signal})...`);
+  stopTweetWatcher();
+  stopTelegramBot();
+  // Close screenshot browser
+  try { require('./screenshot').closeBrowser(); } catch { /* ignore */ }
   writeState({ status: 'STOPPED' });
   sendTelegram(`⏹ <b>Watcher Stopped</b>\n\nSignal: ${signal}`).finally(() => {
     process.exit(0);
