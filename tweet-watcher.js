@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { getUserTweets, getTweetById, getUserId } = require('./twitter-api');
 const { getTweetUsers, getTopicId } = require('./watchlist-manager');
-const { sendTelegram, sendTelegramPhoto } = require('./notify');
+const { sendTelegram, sendTelegramPhoto, uploadTelegramDocument } = require('./notify');
 const { screenshotTweet, screenshotThread } = require('./screenshot');
 
 const SEEN_FILE = path.join(__dirname, 'seen-tweets.json');
@@ -196,7 +196,7 @@ async function processNewTweet(tweet, username, log) {
   log(`📝 New tweet from @${username}: "${tweet.text.substring(0, 60)}..."`);
 
   // Save tweet data
-  const { baseName, dir } = saveTweet(tweet, username);
+  const { baseName, dir, jsonPath } = saveTweet(tweet, username);
 
   // Take screenshot
   const screenshotPath = path.join(dir, `${baseName}.png`);
@@ -219,6 +219,12 @@ async function processNewTweet(tweet, username, log) {
   } else {
     await sendTelegram(msg, topicId);
   }
+
+  // Upload metadata JSON
+  const tweetMetaTopicId = getTopicId(username, 'tweetMetadata');
+  if (jsonPath && tweetMetaTopicId) {
+    await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
+  }
 }
 
 /**
@@ -227,7 +233,7 @@ async function processNewTweet(tweet, username, log) {
 async function processThread(threadTweets, username, log) {
   log(`🧵 Thread detected from @${username} (${threadTweets.length} tweets)`);
 
-  const { baseName, dir } = saveThread(threadTweets, username);
+  const { baseName, dir, jsonPath } = saveThread(threadTweets, username);
 
   // Screenshot the full thread
   const lastTweet = threadTweets[threadTweets.length - 1];
@@ -247,6 +253,12 @@ async function processThread(threadTweets, username, log) {
     await sendTelegramPhoto(screenshotResult, msg, topicId);
   } else {
     await sendTelegram(msg, topicId);
+  }
+
+  // Upload metadata JSON
+  const tweetMetaTopicId = getTopicId(username, 'tweetMetadata');
+  if (jsonPath && tweetMetaTopicId) {
+    await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
   }
 }
 

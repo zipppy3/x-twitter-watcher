@@ -453,6 +453,9 @@ async function cmdSetup() {
     const tweetId = await ask(`  Tweet Screenshot Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
     if (tweetId) writeEnvKey('TELEGRAM_TWEET_THREAD_ID', tweetId);
 
+    const tweetMetaId = await ask(`  Tweet JSON Metadata Topic Thread ID ${c.gray('(press Enter to skip)')}: `);
+    if (tweetMetaId) writeEnvKey('TELEGRAM_TWEET_METADATA_THREAD_ID', tweetMetaId);
+
     console.log(c.cyan('\n  ── 50MB Upload Bypass (Docker) ─────────────'));
     console.log(c.gray('  To upload large files, we run a Local Telegram Bot API Server via Docker.'));
     console.log(c.gray('  Get your API ID and Hash from https://my.telegram.org\n'));

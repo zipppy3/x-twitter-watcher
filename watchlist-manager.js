@@ -142,6 +142,7 @@ function getTopicId(username, type) {
     audio: 'telegramAudioTopicId',
     metadata: 'telegramMetadataTopicId',
     tweet: 'telegramTweetTopicId',
+    tweetMetadata: 'telegramTweetMetadataTopicId',
   }[type];
 
   // Per-user override takes priority
@@ -152,6 +153,7 @@ function getTopicId(username, type) {
     audio: 'TELEGRAM_AUDIO_THREAD_ID',
     metadata: 'TELEGRAM_METADATA_THREAD_ID',
     tweet: 'TELEGRAM_TWEET_THREAD_ID',
+    tweetMetadata: 'TELEGRAM_TWEET_METADATA_THREAD_ID',
   }[type];
 
   return process.env[envKey] || null;
