@@ -27,6 +27,25 @@ function isLocalServer() {
 }
 
 /**
+ * Check if the configured chat is a supergroup (supports Topics).
+ * Supergroup IDs are negative and start with -100.
+ * Personal DMs are positive numbers and don't support Topics.
+ */
+function isSupergroup() {
+  const chatId = process.env.TELEGRAM_CHAT_ID || '';
+  return chatId.startsWith('-100');
+}
+
+/**
+ * Only return the thread ID if the chat supports Topics (supergroup).
+ * Passing message_thread_id to a personal DM chat causes a 400 error.
+ */
+function safeThreadId(threadId) {
+  if (!threadId) return undefined;
+  return isSupergroup() ? threadId : undefined;
+}
+
+/**
  * Send a Telegram bot notification.
  * Falls back to the public API if the local server is unreachable.
  * 
@@ -46,7 +65,8 @@ async function sendTelegram(message, threadId) {
     disable_web_page_preview: true,
   };
 
-  if (threadId) payload.message_thread_id = threadId;
+  const safe = safeThreadId(threadId);
+  if (safe) payload.message_thread_id = safe;
 
   const apiUrl = getTelegramApiUrl();
   const url = `${apiUrl}/bot${botToken}/sendMessage`;
@@ -96,7 +116,8 @@ async function sendTelegramPhoto(filePath, caption, threadId) {
     const url = `${baseUrl}/bot${botToken}/sendPhoto`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    if (threadId) form.append('message_thread_id', threadId);
+    const safe = safeThreadId(threadId);
+    if (safe) form.append('message_thread_id', safe);
     form.append('photo', fs.createReadStream(filePath));
     if (caption) {
       form.append('caption', caption.substring(0, 1024));
@@ -150,7 +171,8 @@ async function uploadTelegramAudio(filePath, title, performer, durationSec, thre
     const url = `${baseUrl}/bot${botToken}/sendAudio`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    if (topicId) form.append('message_thread_id', topicId);
+    const safe = safeThreadId(topicId);
+    if (safe) form.append('message_thread_id', safe);
     form.append('audio', fs.createReadStream(filePath));
     if (title) form.append('title', title);
     if (performer) form.append('performer', performer);
@@ -210,7 +232,8 @@ async function uploadTelegramDocument(filePath, threadId) {
     const url = `${baseUrl}/bot${botToken}/sendDocument`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    if (topicId) form.append('message_thread_id', topicId);
+    const safe = safeThreadId(topicId);
+    if (safe) form.append('message_thread_id', safe);
     form.append('document', fs.createReadStream(filePath));
     return axios.post(url, form, {
       headers: form.getHeaders(),
