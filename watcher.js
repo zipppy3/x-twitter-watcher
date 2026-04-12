@@ -440,7 +440,10 @@ async function cmdSetup() {
   const chatId = await ask(`  Chat ID ${c.gray('(starts with -100 for groups)')}: `);
   if (chatId) writeEnvKey('TELEGRAM_CHAT_ID', chatId);
   
-  if (botToken && chatId) {
+  const activeBotToken = botToken || currentEnv.TELEGRAM_BOT_TOKEN;
+  const activeChatId = chatId || currentEnv.TELEGRAM_CHAT_ID;
+
+  if (activeBotToken && activeChatId) {
     console.log(c.cyan('\n  ── Topic Thread IDs ────────────────────────'));
     console.log(c.gray('  These route uploads to specific Topics in your group.\n'));
 
@@ -474,9 +477,9 @@ async function cmdSetup() {
   }
 
   // Test Telegram
-  if (botToken && chatId) {
-    process.env.TELEGRAM_BOT_TOKEN = botToken;
-    process.env.TELEGRAM_CHAT_ID = chatId;
+  if (activeBotToken && activeChatId) {
+    process.env.TELEGRAM_BOT_TOKEN = activeBotToken;
+    process.env.TELEGRAM_CHAT_ID = activeChatId;
     const { testTelegram } = require('./notify');
     const ok = await testTelegram();
     if (ok) {
