@@ -19,6 +19,8 @@ function defaultUserConfig() {
   return {
     watchSpaces: true,
     watchTweets: true,
+    watchReplies: false,
+    userId: null,
     telegramAudioTopicId: null,
     telegramMetadataTopicId: null,
     telegramTweetTopicId: null,
@@ -68,6 +70,28 @@ function getTweetUsers() {
   return Object.entries(wl.users || {})
     .filter(([, cfg]) => cfg.watchTweets !== false)
     .map(([username]) => username);
+}
+
+/**
+ * Get users who have reply-watching enabled.
+ */
+function getReplyUsers() {
+  const wl = readWatchlist();
+  return Object.entries(wl.users || {})
+    .filter(([, cfg]) => cfg.watchReplies === true)
+    .map(([username]) => username);
+}
+
+/**
+ * Lookup a username by their stored userId (rest_id).
+ * Used to detect handle changes.
+ */
+function getUsernameByRestId(restId) {
+  const wl = readWatchlist();
+  for (const [username, cfg] of Object.entries(wl.users || {})) {
+    if (cfg.userId === restId) return username;
+  }
+  return null;
 }
 
 /**
@@ -179,6 +203,8 @@ module.exports = {
   getUsers,
   getSpaceUsers,
   getTweetUsers,
+  getReplyUsers,
+  getUsernameByRestId,
   getUserConfig,
   addUser,
   removeUser,

@@ -475,10 +475,10 @@ async function main() {
   if (!IS_MINIMAL) {
     const c = chalk || { cyan: { bold: (s) => s } };
     console.log(c.cyan.bold('\n  ╔══════════════════════════════════════╗'));
-    console.log(c.cyan.bold('  ║     X Watcher  v3.0                 ║'));
+    console.log(c.cyan.bold('  ║     X Watcher  v3.1                 ║'));
     console.log(c.cyan.bold('  ╚══════════════════════════════════════╝\n'));
   } else {
-    print.info('X Watcher v3.0 started (minimal mode)');
+    print.info('X Watcher v3.1 started (minimal mode)');
   }
 
   configManager.load();
@@ -514,15 +514,14 @@ async function main() {
   });
 
   // Notify start
-  if (allUsers.length) {
-    sendTelegram(
-      `🟢 <b>X Watcher Started</b>\n\n` +
-      `Mode: ${IS_MINIMAL ? 'Minimal' : 'Interactive'}\n` +
-      `🎙 Spaces: ${spaceUsers.length} users\n` +
-      `📝 Tweets: ${tweetUsers.length} users\n` +
-      `Users: ${allUsers.map(u => '@' + u).join(', ')}`
-    );
-  }
+  sendTelegram(
+    `🟢 <b>X Watcher v3.1 Started</b>\n\n` +
+    `Mode: ${IS_MINIMAL ? 'Minimal' : 'Interactive'}\n` +
+    `🎙 Spaces: ${spaceUsers.length} users\n` +
+    `📝 Tweets: ${tweetUsers.length} users\n` +
+    `Auto-Delete: ${process.env.AUTO_DELETE_UPLOADED === 'true' ? '✅' : '❌'}\n` +
+    (allUsers.length ? `Users: ${allUsers.map(u => '@' + u).join(', ')}` : 'No users yet — use /add to start watching')
+  );
 
   // Mode 1: Download by playlist URL
   if (url && !id) {
@@ -538,10 +537,9 @@ async function main() {
     return;
   }
 
-  // Mode 3: Watch users
+  // Mode 3: Watch users (or wait for /add if no users yet)
   if (!allUsers.length) {
-    print.error('No users specified. Use --user <username> or /add via Telegram');
-    process.exit(1);
+    print.info('No users in watchlist. Waiting for /add via Telegram...');
   }
 
   // ── Start Space Watcher ──
@@ -578,6 +576,7 @@ async function main() {
         uptime,
         spaceUsers: watchlist.getSpaceUsers().length,
         tweetUsers: tweetStatus.watchingUsers,
+        replyUsers: tweetStatus.replyUsers || 0,
         pollCount: state.pollCount || 0,
         activeSpaces: state.activeSpaces || [],
         totalRecordings: (state.recordings || []).length,

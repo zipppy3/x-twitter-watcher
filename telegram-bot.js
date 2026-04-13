@@ -4,13 +4,16 @@
  * Telegram Bot — Interactive command handler for remote management.
  * 
  * Listens for incoming messages via long polling and responds to commands
- * like /add, /remove, /list, /status, /help.
+ * like /add, /remove, /list, /status, /delete, /help.
  * 
  * Only responds to messages from the configured TELEGRAM_CHAT_ID for security.
  */
 
 const path = require('path');
+const fs = require('fs');
 const watchlist = require('./watchlist-manager');
+
+const DOWNLOAD_DIR = path.join(__dirname, 'download');
 
 let bot = null;
 let isRunning = false;
@@ -75,6 +78,9 @@ function startTelegramBot(options = {}) {
         case '/status':
           handleStatus(msg.chat.id, options.getStatus);
           break;
+        case '/delete':
+          handleDelete(msg.chat.id, args);
+          break;
         case '/help':
         case '/start':
           handleHelp(msg.chat.id);
@@ -121,7 +127,7 @@ function stopTelegramBot() {
 // ═══════════════════════════════════════════════════════════════
 
 /**
- * /add <username> [spaces|tweets|all]
+ * /add <username> [spaces|tweets|all] [replies]
  */
 function handleAdd(chatId, args) {
   if (!args.length) {
@@ -129,26 +135,33 @@ function handleAdd(chatId, args) {
       '📖 <b>Usage:</b>\n' +
       '<code>/add username</code> — Watch spaces + tweets\n' +
       '<code>/add username spaces</code> — Watch spaces only\n' +
-      '<code>/add username tweets</code> — Watch tweets only',
+      '<code>/add username tweets</code> — Watch tweets only\n' +
+      '<code>/add username tweets replies</code> — Watch tweets + replies\n' +
+      '<code>/add username all replies</code> — Watch everything + replies',
       { parse_mode: 'HTML' }
     );
     return;
   }
 
   const username = args[0].replace('@', '').toLowerCase();
-  const mode = (args[1] || 'all').toLowerCase();
+  const flags = args.slice(1).map(f => f.toLowerCase());
+
+  const mode = flags.find(f => ['all', 'spaces', 'tweets'].includes(f)) || 'all';
+  const watchReplies = flags.includes('replies');
 
   const options = {
     watchSpaces: mode === 'all' || mode === 'spaces',
     watchTweets: mode === 'all' || mode === 'tweets',
+    watchReplies,
   };
 
   const added = watchlist.addUser(username, options);
 
   if (added) {
     const watching = [];
-    if (options.watchSpaces) watching.push('Spaces');
-    if (options.watchTweets) watching.push('Tweets');
+    if (options.watchSpaces) watching.push('🎙 Spaces');
+    if (options.watchTweets) watching.push('📝 Tweets');
+    if (options.watchReplies) watching.push('💬 Replies');
 
     bot.sendMessage(chatId,
       `✅ <b>Added @${username}</b>\n\nWatching: ${watching.join(' + ')}`,
@@ -201,11 +214,13 @@ function handleList(chatId) {
     const flags = [];
     if (cfg?.watchSpaces !== false) flags.push('🎙 Spaces');
     if (cfg?.watchTweets !== false) flags.push('📝 Tweets');
-    return `• <b>@${u}</b> — ${flags.join(', ')}`;
+    if (cfg?.watchReplies === true) flags.push('💬 Replies');
+    const idTag = cfg?.userId ? ` <code>[${cfg.userId}]</code>` : '';
+    return `• <b>@${u}</b>${idTag}\n  ${flags.join(', ')}`;
   });
 
   bot.sendMessage(chatId,
-    `📋 <b>Watchlist (${users.length} users)</b>\n\n${lines.join('\n')}`,
+    `📋 <b>Watchlist (${users.length} users)</b>\n\n${lines.join('\n\n')}`,
     { parse_mode: 'HTML' }
   );
 }
@@ -221,7 +236,8 @@ function handleStatus(chatId, getStatus) {
 
     msg += `<b>State:</b> ${status.state || 'Unknown'}\n`;
     msg += `<b>Mode:</b> ${status.mode || 'Unknown'}\n`;
-    msg += `<b>Uptime:</b> ${status.uptime || '?'}\n\n`;
+    msg += `<b>Uptime:</b> ${status.uptime || '?'}\n`;
+    msg += `<b>Auto-Delete:</b> ${process.env.AUTO_DELETE_UPLOADED === 'true' ? '✅ On' : '❌ Off'}\n\n`;
 
     // Space watcher info
     msg += `<b>🎙 Spaces</b>\n`;
@@ -235,6 +251,7 @@ function handleStatus(chatId, getStatus) {
     // Tweet watcher info
     msg += `<b>📝 Tweets</b>\n`;
     msg += `  Monitoring: ${status.tweetUsers || 0} users\n`;
+    msg += `  Reply watchers: ${status.replyUsers || 0}\n`;
     msg += `  Tracked tweets: ${status.totalSeenTweets || 0}\n`;
   } else {
     msg += 'Status info unavailable.';
@@ -244,16 +261,124 @@ function handleStatus(chatId, getStatus) {
 }
 
 /**
+ * /delete <username> [spaces|tweets|all]
+ * Delete downloaded data for a user from the local disk.
+ */
+function handleDelete(chatId, args) {
+  if (!args.length) {
+    bot.sendMessage(chatId,
+      '📖 <b>Usage:</b>\n' +
+      '<code>/delete username tweets</code> — Delete tweet data\n' +
+      '<code>/delete username spaces</code> — Delete space recordings\n' +
+      '<code>/delete username all</code> — Delete everything\n\n' +
+      '⚠️ This permanently removes downloaded files from disk.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const username = args[0].replace('@', '').toLowerCase();
+  const target = (args[1] || 'all').toLowerCase();
+  const userDir = path.join(DOWNLOAD_DIR, username);
+
+  if (!fs.existsSync(userDir)) {
+    bot.sendMessage(chatId,
+      `⚠️ No downloaded data found for @${username}.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  let deletedCount = 0;
+  let freedBytes = 0;
+
+  try {
+    if (target === 'tweets') {
+      const tweetsDir = path.join(userDir, 'tweets');
+      if (fs.existsSync(tweetsDir)) {
+        const stats = getDirSize(tweetsDir);
+        deletedCount = stats.files;
+        freedBytes = stats.bytes;
+        fs.rmSync(tweetsDir, { recursive: true, force: true });
+      }
+    } else if (target === 'spaces') {
+      // Space files are directly in the user folder (m4a, txt, json)
+      const files = fs.readdirSync(userDir).filter(f => !fs.statSync(path.join(userDir, f)).isDirectory());
+      for (const f of files) {
+        const fp = path.join(userDir, f);
+        freedBytes += fs.statSync(fp).size;
+        fs.rmSync(fp);
+        deletedCount++;
+      }
+    } else if (target === 'all') {
+      const stats = getDirSize(userDir);
+      deletedCount = stats.files;
+      freedBytes = stats.bytes;
+      fs.rmSync(userDir, { recursive: true, force: true });
+    } else {
+      bot.sendMessage(chatId, '⚠️ Invalid target. Use: <code>tweets</code>, <code>spaces</code>, or <code>all</code>', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const freedMB = (freedBytes / (1024 * 1024)).toFixed(1);
+    bot.sendMessage(chatId,
+      `🗑 <b>Deleted ${target} data for @${username}</b>\n\n` +
+      `Files removed: ${deletedCount}\n` +
+      `Freed: ${freedMB} MB`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err) {
+    bot.sendMessage(chatId,
+      `❌ <b>Delete failed</b>\n\n<code>${err.message}</code>`,
+      { parse_mode: 'HTML' }
+    );
+  }
+}
+
+/**
+ * Get total size and file count of a directory (recursive).
+ */
+function getDirSize(dirPath) {
+  let files = 0;
+  let bytes = 0;
+
+  function walk(dir) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath);
+        } else {
+          files++;
+          try { bytes += fs.statSync(fullPath).size; } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  walk(dirPath);
+  return { files, bytes };
+}
+
+/**
  * /help
  */
 function handleHelp(chatId) {
   bot.sendMessage(chatId,
     `🤖 <b>X Watcher Bot Commands</b>\n\n` +
-    `/add username — Add user (spaces + tweets)\n` +
+    `<b>User Management</b>\n` +
+    `/add username — Watch spaces + tweets\n` +
     `/add username spaces — Watch spaces only\n` +
     `/add username tweets — Watch tweets only\n` +
+    `/add username tweets replies — Tweets + replies\n` +
     `/remove username — Remove user\n` +
-    `/list — Show all watched users\n` +
+    `/list — Show all watched users\n\n` +
+    `<b>Data Management</b>\n` +
+    `/delete username tweets — Delete tweet data\n` +
+    `/delete username spaces — Delete recordings\n` +
+    `/delete username all — Delete everything\n\n` +
+    `<b>System</b>\n` +
     `/status — Show system status\n` +
     `/help — Show this message`,
     { parse_mode: 'HTML' }

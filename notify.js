@@ -27,25 +27,6 @@ function isLocalServer() {
 }
 
 /**
- * Check if the configured chat is a supergroup (supports Topics).
- * Supergroup IDs are negative and start with -100.
- * Personal DMs are positive numbers and don't support Topics.
- */
-function isSupergroup() {
-  const chatId = process.env.TELEGRAM_CHAT_ID || '';
-  return chatId.startsWith('-100');
-}
-
-/**
- * Only return the thread ID if the chat supports Topics (supergroup).
- * Passing message_thread_id to a personal DM chat causes a 400 error.
- */
-function safeThreadId(threadId) {
-  if (!threadId) return undefined;
-  return isSupergroup() ? threadId : undefined;
-}
-
-/**
  * Send a Telegram bot notification.
  * Falls back to the public API if the local server is unreachable.
  * 
@@ -65,8 +46,7 @@ async function sendTelegram(message, threadId) {
     disable_web_page_preview: true,
   };
 
-  const safe = safeThreadId(threadId);
-  if (safe) payload.message_thread_id = safe;
+  if (threadId) payload.message_thread_id = threadId;
 
   const apiUrl = getTelegramApiUrl();
   const url = `${apiUrl}/bot${botToken}/sendMessage`;
@@ -116,8 +96,7 @@ async function sendTelegramPhoto(filePath, caption, threadId) {
     const url = `${baseUrl}/bot${botToken}/sendPhoto`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    const safe = safeThreadId(threadId);
-    if (safe) form.append('message_thread_id', safe);
+    if (threadId) form.append('message_thread_id', threadId);
     form.append('photo', fs.createReadStream(filePath));
     if (caption) {
       form.append('caption', caption.substring(0, 1024));
@@ -171,8 +150,7 @@ async function uploadTelegramAudio(filePath, title, performer, durationSec, thre
     const url = `${baseUrl}/bot${botToken}/sendAudio`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    const safe = safeThreadId(topicId);
-    if (safe) form.append('message_thread_id', safe);
+    if (topicId) form.append('message_thread_id', topicId);
     form.append('audio', fs.createReadStream(filePath));
     if (title) form.append('title', title);
     if (performer) form.append('performer', performer);
@@ -232,8 +210,7 @@ async function uploadTelegramDocument(filePath, threadId) {
     const url = `${baseUrl}/bot${botToken}/sendDocument`;
     const form = new FormData();
     form.append('chat_id', chatId);
-    const safe = safeThreadId(topicId);
-    if (safe) form.append('message_thread_id', safe);
+    if (topicId) form.append('message_thread_id', topicId);
     form.append('document', fs.createReadStream(filePath));
     return axios.post(url, form, {
       headers: form.getHeaders(),
@@ -262,10 +239,150 @@ async function uploadTelegramDocument(filePath, threadId) {
   }
 }
 
-module.exports = { 
-  sendTelegram, 
+/**
+ * Send a video file to a Telegram Topic.
+ * Falls back to public API if local server is down.
+ * 
+ * @param {string} filePath - Path to the video file
+ * @param {string} caption - HTML caption
+ * @param {string|null} threadId - Topic thread ID
+ */
+async function sendTelegramVideo(filePath, caption, threadId) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId || !fs.existsSync(filePath)) return false;
+
+  async function doUpload(baseUrl) {
+    const url = `${baseUrl}/bot${botToken}/sendVideo`;
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    const safe = safeThreadId(threadId);
+    if (safe) form.append('message_thread_id', safe);
+    form.append('video', fs.createReadStream(filePath));
+    if (caption) {
+      form.append('caption', caption.substring(0, 1024));
+      form.append('parse_mode', 'HTML');
+    }
+    form.append('supports_streaming', 'true');
+    return axios.post(url, form, {
+      headers: form.getHeaders(),
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 120000,
+    });
+  }
+
+  try {
+    const res = await doUpload(getTelegramApiUrl());
+    return res.status === 200;
+  } catch (err) {
+    if (isLocalServer() && (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET')) {
+      console.log('[Telegram] Local server down, falling back to public API for video');
+      try {
+        const res = await doUpload(PUBLIC_API);
+        return res.status === 200;
+      } catch (fallbackErr) {
+        console.error('Telegram Video Upload Error (fallback):', fallbackErr.message);
+      }
+    } else {
+      console.error('Telegram Video Upload Error:', err.message);
+    }
+    return false;
+  }
+}
+
+/**
+ * Send multiple media files as a grouped album to Telegram.
+ * Supports photos and videos mixed together (2-10 items).
+ * Falls back to public API if local server is down.
+ * 
+ * @param {Array<{type: 'photo'|'video', path: string}>} mediaItems - Media to group
+ * @param {string} caption - HTML caption (attached to first item)
+ * @param {string|null} threadId - Topic thread ID
+ */
+async function sendTelegramMediaGroup(mediaItems, caption, threadId) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId || !mediaItems?.length) return false;
+
+  // Filter out items where the file doesn't exist
+  const validItems = mediaItems.filter(item => fs.existsSync(item.path));
+  if (!validItems.length) return false;
+
+  // Telegram requires 2-10 items for a media group
+  if (validItems.length === 1) {
+    // Single item: use the specific uploader instead
+    const item = validItems[0];
+    if (item.type === 'video') {
+      return sendTelegramVideo(item.path, caption, threadId);
+    } else {
+      return sendTelegramPhoto(item.path, caption, threadId);
+    }
+  }
+
+  // Cap at 10 items (Telegram limit)
+  const items = validItems.slice(0, 10);
+
+  async function doUpload(baseUrl) {
+    const url = `${baseUrl}/bot${botToken}/sendMediaGroup`;
+    const form = new FormData();
+    form.append('chat_id', chatId);
+    const safe = safeThreadId(threadId);
+    if (safe) form.append('message_thread_id', safe);
+
+    // Build the media array descriptor
+    const mediaArray = items.map((item, i) => {
+      const attachKey = `file${i}`;
+      form.append(attachKey, fs.createReadStream(item.path));
+      const entry = {
+        type: item.type || 'photo',
+        media: `attach://${attachKey}`,
+      };
+      // Caption only on first item
+      if (i === 0 && caption) {
+        entry.caption = caption.substring(0, 1024);
+        entry.parse_mode = 'HTML';
+      }
+      return entry;
+    });
+
+    form.append('media', JSON.stringify(mediaArray));
+
+    return axios.post(url, form, {
+      headers: form.getHeaders(),
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 120000,
+    });
+  }
+
+  try {
+    const res = await doUpload(getTelegramApiUrl());
+    return res.status === 200;
+  } catch (err) {
+    if (isLocalServer() && (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET')) {
+      console.log('[Telegram] Local server down, falling back to public API for media group');
+      try {
+        const res = await doUpload(PUBLIC_API);
+        return res.status === 200;
+      } catch (fallbackErr) {
+        console.error('Telegram MediaGroup Upload Error (fallback):', fallbackErr.message);
+      }
+    } else {
+      console.error('Telegram MediaGroup Upload Error:', err.message);
+    }
+    return false;
+  }
+}
+
+module.exports = {
+  sendTelegram,
   testTelegram,
   sendTelegramPhoto,
-  uploadTelegramAudio, 
+  sendTelegramVideo,
+  sendTelegramMediaGroup,
+  uploadTelegramAudio,
   uploadTelegramDocument,
 };

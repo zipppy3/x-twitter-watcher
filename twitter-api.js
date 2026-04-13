@@ -107,6 +107,30 @@ async function getUserTweets(userId, count = 20) {
 }
 
 /**
+ * Fetch the latest tweets AND replies for a user by their numeric ID.
+ * @param {string} userId - Numeric user ID
+ * @param {number} count - Number of entries to fetch (default 20)
+ * @returns {Array} Parsed tweets + replies
+ */
+async function getUserTweetsAndReplies(userId, count = 20) {
+  const headers = getAuthHeaders();
+  if (!headers) return [];
+
+  try {
+    const url = buildUrl(twitterGraphqlEndpoints.UserTweetsAndReplies);
+    const params = cloneParams(twitterGraphqlParams.UserTweetsAndReplies, {
+      variables: { userId, count },
+    });
+
+    const { data } = await axios.get(url, { headers, params });
+    return parseTweetsResponse(data);
+  } catch (err) {
+    console.error(`[TwitterAPI] getUserTweetsAndReplies error:`, err.response?.status, err.message);
+    return [];
+  }
+}
+
+/**
  * Fetch a single tweet by its ID (for thread/reply context).
  * @param {string} tweetId
  * @returns {object|null} Parsed tweet
@@ -236,6 +260,7 @@ module.exports = {
   getAuthHeaders,
   getUserId,
   getUserTweets,
+  getUserTweetsAndReplies,
   getTweetById,
   parseSingleTweet,
 };

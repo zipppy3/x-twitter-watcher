@@ -3,15 +3,17 @@
 /**
  * Tweet Watcher — Polls Twitter for new tweets from watched users.
  * 
- * Saves tweets as JSON + TXT, takes screenshots, and sends notifications.
+ * Saves tweets as JSON + TXT, downloads media, takes screenshots,
+ * sends grouped media albums to Telegram, and supports auto-delete.
  * Alternates poll interval between 60s and 120s to appear more human-like.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { getUserTweets, getTweetById, getUserId } = require('./twitter-api');
-const { getTweetUsers, getTopicId } = require('./watchlist-manager');
-const { sendTelegram, sendTelegramPhoto, uploadTelegramDocument } = require('./notify');
+const axios = require('axios');
+const { getUserTweets, getUserTweetsAndReplies, getTweetById, getUserId } = require('./twitter-api');
+const { getTweetUsers, getReplyUsers, getTopicId, getUserConfig, updateUser } = require('./watchlist-manager');
+const { sendTelegram, sendTelegramPhoto, sendTelegramMediaGroup, uploadTelegramDocument } = require('./notify');
 const { screenshotTweet, screenshotThread } = require('./screenshot');
 
 const SEEN_FILE = path.join(__dirname, 'seen-tweets.json');
@@ -55,13 +57,24 @@ function saveSeenTweets() {
 }
 
 /**
- * Ensure user ID is cached.
+ * Ensure user ID is cached and stored in watchlist.
  */
 async function ensureUserId(username) {
   if (userIdCache[username]) return userIdCache[username];
 
+  // Check watchlist for stored userId first
+  const cfg = getUserConfig(username);
+  if (cfg?.userId) {
+    userIdCache[username] = cfg.userId;
+    return cfg.userId;
+  }
+
   const id = await getUserId(username);
-  if (id) userIdCache[username] = id;
+  if (id) {
+    userIdCache[username] = id;
+    // Persist the userId in the watchlist for handle-change resilience
+    updateUser(username, { userId: id });
+  }
   return id;
 }
 
@@ -87,8 +100,81 @@ function truncateForFilename(text) {
 }
 
 /**
+ * Download a single media file (image or video) to disk.
+ * @param {string} url - URL to download from
+ * @param {string} outputPath - Where to save the file
+ * @returns {string|null} Path on success, null on failure
+ */
+async function downloadMedia(url, outputPath) {
+  try {
+    const dir = path.dirname(outputPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    const response = await axios.get(url, {
+      responseType: 'stream',
+      timeout: 60000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+    });
+
+    const writer = fs.createWriteStream(outputPath);
+    response.data.pipe(writer);
+
+    return new Promise((resolve) => {
+      writer.on('finish', () => resolve(outputPath));
+      writer.on('error', () => resolve(null));
+    });
+  } catch (err) {
+    console.error(`[TweetWatcher] Media download failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Download all media from a tweet to disk.
+ * @param {object} tweet - Parsed tweet object
+ * @param {string} dir - Base directory for downloads
+ * @param {string} baseName - Base filename prefix
+ * @returns {Array<{type: string, path: string}>} Downloaded media items
+ */
+async function downloadTweetMedia(tweet, dir, baseName) {
+  const downloadedMedia = [];
+
+  if (!tweet.media?.length) return downloadedMedia;
+
+  for (let i = 0; i < tweet.media.length; i++) {
+    const m = tweet.media[i];
+    let ext = '.jpg';
+    let mediaUrl = m.url;
+
+    if (m.type === 'video' || m.type === 'animated_gif') {
+      ext = '.mp4';
+    } else if (m.type === 'photo') {
+      // Get highest quality by appending ?format=jpg&name=orig
+      const origUrl = m.url.replace(/\?.*$/, '');
+      mediaUrl = origUrl.includes('?') ? origUrl : `${origUrl}?format=jpg&name=orig`;
+      ext = '.jpg';
+    }
+
+    const filename = `${baseName}_media${i + 1}${ext}`;
+    const filePath = path.join(dir, filename);
+
+    const result = await downloadMedia(mediaUrl, filePath);
+    if (result) {
+      downloadedMedia.push({
+        type: (m.type === 'video' || m.type === 'animated_gif') ? 'video' : 'photo',
+        path: result,
+      });
+    }
+  }
+
+  return downloadedMedia;
+}
+
+/**
  * Save a tweet to disk in JSON and TXT formats.
- * @returns {{ jsonPath: string, txtPath: string, dir: string }}
+ * @returns {{ jsonPath: string, txtPath: string, dir: string, baseName: string }}
  */
 function saveTweet(tweet, username) {
   const dir = path.join(DOWNLOAD_DIR, username, 'tweets');
@@ -187,7 +273,29 @@ async function collectThread(tweets, userId) {
 }
 
 /**
- * Process a single new tweet: save it, screenshot it, notify Telegram.
+ * Try to clean up local files after successful upload.
+ * Only deletes if AUTO_DELETE_UPLOADED=true.
+ * 
+ * @param {string[]} filePaths - Array of file paths to delete
+ * @param {function} log - Logger
+ */
+function autoDeleteFiles(filePaths, log) {
+  if (process.env.AUTO_DELETE_UPLOADED !== 'true') return;
+
+  for (const fp of filePaths) {
+    try {
+      if (fs.existsSync(fp)) {
+        fs.rmSync(fp);
+        log(`🗑 Auto-deleted: ${path.basename(fp)}`);
+      }
+    } catch (err) {
+      console.error(`[TweetWatcher] Auto-delete failed for ${fp}: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Process a single new tweet: save it, download media, screenshot it, notify Telegram.
  */
 async function processNewTweet(tweet, username, log) {
   // Skip retweets (we only care about original content)
@@ -196,7 +304,10 @@ async function processNewTweet(tweet, username, log) {
   log(`📝 New tweet from @${username}: "${tweet.text.substring(0, 60)}..."`);
 
   // Save tweet data
-  const { baseName, dir, jsonPath } = saveTweet(tweet, username);
+  const { baseName, dir, jsonPath, txtPath } = saveTweet(tweet, username);
+
+  // Download associated media (images/videos)
+  const downloadedMedia = await downloadTweetMedia(tweet, dir, baseName);
 
   // Take screenshot
   const screenshotPath = path.join(dir, `${baseName}.png`);
@@ -213,17 +324,52 @@ async function processNewTweet(tweet, username, log) {
     `❤ ${tweet.metrics?.likes || 0}  🔁 ${tweet.metrics?.retweets || 0}\n` +
     `🔗 https://x.com/${username}/status/${tweet.id}`;
 
-  // Send screenshot if available, otherwise text-only
-  if (screenshotResult) {
-    await sendTelegramPhoto(screenshotResult, msg, topicId);
+  // Track all files for potential auto-delete
+  const allFiles = [jsonPath, txtPath];
+  if (screenshotResult) allFiles.push(screenshotResult);
+  downloadedMedia.forEach(m => allFiles.push(m.path));
+
+  let uploadSuccess = false;
+
+  // Build media items: screenshot first, then downloaded media
+  if (screenshotResult || downloadedMedia.length) {
+    const mediaItems = [];
+
+    // Add screenshot as the first photo
+    if (screenshotResult) {
+      mediaItems.push({ type: 'photo', path: screenshotResult });
+    }
+
+    // Add downloaded tweet media
+    mediaItems.push(...downloadedMedia);
+
+    if (mediaItems.length >= 2) {
+      // Send as grouped album
+      uploadSuccess = await sendTelegramMediaGroup(mediaItems, msg, topicId);
+    } else if (mediaItems.length === 1) {
+      // Single item
+      if (mediaItems[0].type === 'video') {
+        const { sendTelegramVideo } = require('./notify');
+        uploadSuccess = await sendTelegramVideo(mediaItems[0].path, msg, topicId);
+      } else {
+        uploadSuccess = await sendTelegramPhoto(mediaItems[0].path, msg, topicId);
+      }
+    }
   } else {
-    await sendTelegram(msg, topicId);
+    // No media at all — text-only
+    uploadSuccess = await sendTelegram(msg, topicId);
   }
 
   // Upload metadata JSON
   const tweetMetaTopicId = getTopicId(username, 'tweetMetadata');
   if (jsonPath && tweetMetaTopicId) {
-    await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
+    const metaOk = await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
+    if (!metaOk) uploadSuccess = false; // Don't auto-delete if metadata upload failed
+  }
+
+  // Auto-delete if everything uploaded successfully
+  if (uploadSuccess) {
+    autoDeleteFiles(allFiles, log);
   }
 }
 
@@ -233,7 +379,14 @@ async function processNewTweet(tweet, username, log) {
 async function processThread(threadTweets, username, log) {
   log(`🧵 Thread detected from @${username} (${threadTweets.length} tweets)`);
 
-  const { baseName, dir, jsonPath } = saveThread(threadTweets, username);
+  const { baseName, dir, jsonPath, txtPath } = saveThread(threadTweets, username);
+
+  // Download media from all thread tweets
+  const allDownloadedMedia = [];
+  for (const tweet of threadTweets) {
+    const media = await downloadTweetMedia(tweet, dir, baseName);
+    allDownloadedMedia.push(...media);
+  }
 
   // Screenshot the full thread
   const lastTweet = threadTweets[threadTweets.length - 1];
@@ -249,21 +402,40 @@ async function processThread(threadTweets, username, log) {
     `<blockquote>${threadTweets[0].text.substring(0, 200)}${threadTweets[0].text.length > 200 ? '...' : ''}</blockquote>\n` +
     `🔗 https://x.com/${username}/status/${lastTweet.id}`;
 
-  if (screenshotResult) {
-    await sendTelegramPhoto(screenshotResult, msg, topicId);
+  const allFiles = [jsonPath, txtPath];
+  if (screenshotResult) allFiles.push(screenshotResult);
+  allDownloadedMedia.forEach(m => allFiles.push(m.path));
+
+  let uploadSuccess = false;
+
+  if (screenshotResult || allDownloadedMedia.length) {
+    const mediaItems = [];
+    if (screenshotResult) mediaItems.push({ type: 'photo', path: screenshotResult });
+    mediaItems.push(...allDownloadedMedia);
+
+    if (mediaItems.length >= 2) {
+      uploadSuccess = await sendTelegramMediaGroup(mediaItems, msg, topicId);
+    } else {
+      uploadSuccess = await sendTelegramPhoto(mediaItems[0].path, msg, topicId);
+    }
   } else {
-    await sendTelegram(msg, topicId);
+    uploadSuccess = await sendTelegram(msg, topicId);
   }
 
   // Upload metadata JSON
   const tweetMetaTopicId = getTopicId(username, 'tweetMetadata');
   if (jsonPath && tweetMetaTopicId) {
-    await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
+    const metaOk = await uploadTelegramDocument(jsonPath, tweetMetaTopicId);
+    if (!metaOk) uploadSuccess = false;
+  }
+
+  if (uploadSuccess) {
+    autoDeleteFiles(allFiles, log);
   }
 }
 
 /**
- * Check a single user for new tweets.
+ * Check a single user for new tweets (and optionally replies).
  */
 async function checkUserTweets(username, log) {
   const userId = await ensureUserId(username);
@@ -272,7 +444,14 @@ async function checkUserTweets(username, log) {
     return;
   }
 
-  const tweets = await getUserTweets(userId);
+  // Determine which endpoint to use based on per-user config
+  const cfg = getUserConfig(username);
+  const useReplies = cfg?.watchReplies === true;
+
+  const tweets = useReplies
+    ? await getUserTweetsAndReplies(userId)
+    : await getUserTweets(userId);
+
   if (!tweets.length) return;
 
   // Initialize seen set for this user
@@ -391,10 +570,12 @@ function stopTweetWatcher() {
  */
 function getTweetWatcherStatus() {
   const users = getTweetUsers();
+  const replyUsers = getReplyUsers();
   const totalSeen = Object.values(seenTweets).reduce((sum, set) => sum + set.size, 0);
   return {
     running: isRunning,
     watchingUsers: users.length,
+    replyUsers: replyUsers.length,
     users,
     totalSeenTweets: totalSeen,
   };

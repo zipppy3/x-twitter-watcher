@@ -97,7 +97,7 @@ function timeAgo(isoString) {
 
 function banner() {
   console.log(c.cyanBold('\n  ╔══════════════════════════════════════╗'));
-  console.log(c.cyanBold('  ║     X Watcher  v3.0                 ║'));
+  console.log(c.cyanBold('  ║     X Watcher  v3.1                 ║'));
   console.log(c.cyanBold('  ╚══════════════════════════════════════╝\n'));
 }
 
@@ -112,8 +112,16 @@ async function cmdStart(args) {
   const id = idIdx !== -1 ? args[idIdx + 1] : null;
 
   if (!user && !id) {
-    console.log(c.red('  ✖ No target specified. Use --user <username> or --id <space_id>\n'));
-    return;
+    // No --user specified. Check if the watchlist has users.
+    const watchlist = require('./watchlist-manager');
+    const existingUsers = watchlist.getUsers();
+    if (!existingUsers.length) {
+      console.log(c.yellow('  ⚠ No users in watchlist. Add users first:\n'));
+      console.log(c.gray('    node watcher.js add <username>'));
+      console.log(c.gray('    or use /add in Telegram\n'));
+      return;
+    }
+    // Continue with existing users from watchlist — no --user needed
   }
 
   const isMinimal = args.includes('--minimal');
@@ -243,7 +251,7 @@ function cmdStatus() {
 
   console.log();
   console.log('  ┌───────────────────────────────────────────┐');
-  console.log('  │  ' + c.bold('X Watcher v3.0      ') + '                    │');
+  console.log('  │  ' + c.bold('X Watcher v3.1      ') + '                    │');
   console.log('  ├───────────────────────────────────────────┤');
 
   if (!state && !pm2Running) {
@@ -533,6 +541,105 @@ async function cmdUpdateTokens() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Command: add <username> [--tweets] [--spaces] [--replies]
+// ═══════════════════════════════════════════════════════════════
+function cmdAdd(addArgs) {
+  if (!addArgs.length || addArgs[0].startsWith('--')) {
+    console.log(c.red('\n  ✖ Usage: node watcher.js add <username> [--tweets] [--spaces] [--replies]\n'));
+    return;
+  }
+
+  const watchlist = require('./watchlist-manager');
+  const username = addArgs[0].replace('@', '').toLowerCase();
+
+  const tweetsOnly = addArgs.includes('--tweets');
+  const spacesOnly = addArgs.includes('--spaces');
+  const watchReplies = addArgs.includes('--replies');
+
+  const options = {
+    watchSpaces: spacesOnly || (!tweetsOnly && !spacesOnly), // default: true
+    watchTweets: tweetsOnly || (!tweetsOnly && !spacesOnly), // default: true
+    watchReplies,
+  };
+
+  const added = watchlist.addUser(username, options);
+
+  if (added) {
+    const flags = [];
+    if (options.watchSpaces) flags.push('🎙 Spaces');
+    if (options.watchTweets) flags.push('📝 Tweets');
+    if (options.watchReplies) flags.push('💬 Replies');
+
+    console.log(c.green(`\n  ✅ Added @${username} to watchlist`));
+    console.log(`  Watching: ${flags.join(' + ')}\n`);
+  } else {
+    console.log(c.yellow(`\n  ⚠ @${username} is already in the watchlist.`));
+    console.log(c.gray('  Use /remove via Telegram or edit watchlist.json to change settings.\n'));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Command: update
+// ═══════════════════════════════════════════════════════════════
+function cmdUpdate() {
+  banner();
+  console.log('  ' + c.bold('Updating X Watcher...\n'));
+
+  const isWindows = process.platform === 'win32';
+
+  try {
+    // Step 1: Pull latest changes (if using git)
+    console.log(c.cyan('  [1/4] Pulling latest changes...'));
+    try {
+      execSync('git pull', { stdio: 'inherit', cwd: __dirname });
+    } catch {
+      console.log(c.yellow('  ⚠ Git pull failed (not a git repo or no remote). Skipping.'));
+    }
+
+    // Step 2: Update npm dependencies
+    console.log(c.cyan('\n  [2/4] Updating npm packages...'));
+    execSync('npm update', { stdio: 'inherit', cwd: __dirname });
+
+    // Step 3: Re-apply download speed patch
+    const downloaderFile = path.join(__dirname, 'node_modules', 'twspace-crawler', 'dist', 'modules', 'SpaceDownloader.js');
+    if (fs.existsSync(downloaderFile)) {
+      console.log(c.cyan('\n  [3/4] Re-applying download speed patch...'));
+      let content = fs.readFileSync(downloaderFile, 'utf8');
+      content = content.replace(/maxConcurrent:\s*5/g, 'maxConcurrent: 20');
+      fs.writeFileSync(downloaderFile, content);
+      console.log(c.gray('  → maxConcurrent set to 20'));
+    } else {
+      console.log(c.gray('\n  [3/4] SpaceDownloader.js not found, skipping patch'));
+    }
+
+    // Step 4: Update Playwright browser
+    console.log(c.cyan('\n  [4/4] Updating Playwright browser...'));
+    try {
+      execSync('npx playwright install chromium', { stdio: 'inherit', cwd: __dirname });
+    } catch {
+      console.log(c.yellow('  ⚠ Playwright update skipped.'));
+    }
+
+    console.log(c.green('\n  ✅ Update complete!\n'));
+
+    // Restart PM2 if running
+    if (pm2Installed()) {
+      try {
+        const raw = execSync('pm2 jlist', { stdio: 'pipe' }).toString();
+        const processes = JSON.parse(raw);
+        const proc = processes.find(p => p.name === PM2_NAME);
+        if (proc && proc.pm2_env?.status === 'online') {
+          execSync(`pm2 restart ${PM2_NAME}`, { stdio: 'pipe' });
+          console.log(c.green('  ✅ Watcher restarted.\n'));
+        }
+      } catch {}
+    }
+  } catch (err) {
+    console.log(c.red(`\n  ✖ Update failed: ${err.message}\n`));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Command Router
 // ═══════════════════════════════════════════════════════════════
 const args = process.argv.slice(2);
@@ -568,6 +675,14 @@ async function run() {
       await cmdUpdateTokens();
       break;
 
+    case 'add':
+      cmdAdd(args.slice(1));
+      break;
+
+    case 'update':
+      cmdUpdate();
+      break;
+
     case 'help':
     case '--help':
     case '-h':
@@ -583,12 +698,19 @@ async function run() {
       console.log(`      --log           Enable file logging`);
       console.log(`      --force         Force download (with --id)`);
       console.log();
+      console.log(`    ${c.cyan('add')}             Add a user to the watchlist`);
+      console.log(`      <username>      Username to add`);
+      console.log(`      --tweets        Watch tweets only`);
+      console.log(`      --spaces        Watch spaces only`);
+      console.log(`      --replies       Also watch replies`);
+      console.log();
       console.log(`    ${c.cyan('stop')}            Stop the background watcher`);
       console.log(`    ${c.cyan('status')}          Show current watcher status`);
       console.log(`    ${c.cyan('logs')}            View live logs of background watcher`);
       console.log(`    ${c.cyan('switch')}          Switch between Background and Foreground mode`);
       console.log(`    ${c.cyan('setup')}           First-time setup wizard`);
       console.log(`    ${c.cyan('update-tokens')}   Update Twitter tokens manually`);
+      console.log(`    ${c.cyan('update')}          Update to the latest version`);
       console.log(`    ${c.cyan('help')}            Show this help\n`);
       break;
 
