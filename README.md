@@ -1,11 +1,11 @@
 <div align="center">
 
-# X Space Watcher
+# X/Twitter Watcher Framework
 
-![Version](https://img.shields.io/badge/version-2.0-blue.svg)
+![Version](https://img.shields.io/badge/version-3.1-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-A robust, 24/7 automated monitoring and recording daemon for Twitter / X Spaces. Designed for both personal desktop use and headless server deployments.
+A robust, 24/7 automated monitoring and archival daemon for X (Twitter) Spaces AND Tweets. Designed for both personal desktop use and headless server deployments.
 
 </div>
 
@@ -14,11 +14,11 @@ A robust, 24/7 automated monitoring and recording daemon for Twitter / X Spaces.
 ## 🚀 Features
 
 * **Headless Daemon Mode:** Runs flawlessly in the background on bare-metal servers (Ubuntu/Debian) via PM2. Survives terminal closures and system reboots.
-* **Interactive Mode:** A beautifully formatted, colorful CLI for local desktop monitoring with live timers and status indicators.
-* **Telegram Notifications:** Get instantly pinged when a mapped user goes live, when a recording completes, or if your session expires.
-* **Smart File Management:** No more cluttered `.json` dumps. Saves a pristine `.m4a` audio file named after the Space title, alongside a clean `.txt` file containing the host, duration, and a list of speakers.
+* **Full Tweet & Media Archiving:** Not just Spaces! Monitors timelines and automatically downloads tweets, JSON metadata, photos, and standardizes multi-video tweets into grouped Telegram albums.
+* **Per-User Fine-Tuning:** Track original tweets only or include full reply threads (`watchReplies`) on a per-user basis. Uses static `rest_id` tracking so it doesn't break if a user changes their `@handle`.
+* **Interactive Telegram Bot:** Add users, remove users, check system status, or `/delete` local storage directly from your phone.
+* **Smart File Management & Auto-Delete:** Saves pristine `.m4a` audio files and `.txt` metadata. Optional `AUTO_DELETE_UPLOADED=true` to clean up server disk space immediately after a successful Telegram upload.
 * **Auto-Refreshing Tokens:** Includes a Playwright-powered script to automatically launch a browser profile, extract fresh cookies, and update your configuration if your Twitter session drops.
-* **Fast Downloads:** Patched specifically to increase concurrent audio chunk downloads (400% faster processing when a Space ends).
 
 ---
 
@@ -94,8 +94,10 @@ The `watcher.js` CLI controls the entire application.
 
 | Command | Description |
 |---|---|
-| `node watcher.js start --user <username>` | Stars watching a comma-separated list of usernames |
+| `node watcher.js start` | Starts watching users (reads from your `watchlist.json`) |
 | `node watcher.js start --id <space_id>` | Immediately downloads a specific active or recorded Space by ID |
+| `node watcher.js add <username>` | Adds a user to watchlist (flags: `--tweets`, `--spaces`, `--replies`) |
+| `node watcher.js update` | Automatically runs `git pull`, updates NPM packages, and patches downloads |
 | `node watcher.js stop` | Safely stops the background daemon |
 | `node watcher.js status` | Shows a clean overview of monitor status, uptime, and recent recordings |
 | `node watcher.js switch` | Instantly swaps the watcher between Background PM2 and Foreground Interactive modes |
@@ -104,7 +106,7 @@ The `watcher.js` CLI controls the entire application.
 
 ### Running 24/7
 
-When you run `node watcher.js start --user elonmusk`, the CLI will ask you to choose a mode:
+When you run `node watcher.js start`, the CLI will ask you to choose a mode:
 1. **Minimalistic**: Disables all terminal colors and UI, hands the process to PM2, and runs silently in the background forever.
 2. **Interactive**: Boots up exactly where you are, with colorful live timers and polling indicators.
 
