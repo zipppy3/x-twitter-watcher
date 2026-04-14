@@ -108,7 +108,11 @@ async function getUserTweets(userId, count = 20) {
 
 /**
  * Fetch the latest tweets AND replies for a user by their numeric ID.
- * @param {string} userId - Numeric user ID
+ * Uses the V2 endpoint (UserWithProfileTweetsAndRepliesQueryV2) which
+ * has a more up-to-date queryId. Falls back to the old endpoint if V2
+ * is unavailable.
+ * 
+ * @param {string} userId - Numeric user ID (rest_id)
  * @param {number} count - Number of entries to fetch (default 20)
  * @returns {Array} Parsed tweets + replies
  */
@@ -116,6 +120,26 @@ async function getUserTweetsAndReplies(userId, count = 20) {
   const headers = getAuthHeaders();
   if (!headers) return [];
 
+  // Try V2 endpoint first (uses rest_id param instead of userId)
+  const v2Endpoint = twitterGraphqlEndpoints.UserWithProfileTweetsAndRepliesQueryV2;
+  const v2Params = twitterGraphqlParams.UserWithProfileTweetsAndRepliesQueryV2;
+
+  if (v2Endpoint && v2Params) {
+    try {
+      const url = buildUrl(v2Endpoint);
+      const params = cloneParams(v2Params, {
+        variables: { rest_id: userId },
+      });
+
+      const { data } = await axios.get(url, { headers, params });
+      return parseTweetsResponse(data);
+    } catch (err) {
+      console.error(`[TwitterAPI] V2 TweetsAndReplies error:`, err.response?.status, err.message);
+      // Fall through to old endpoint
+    }
+  }
+
+  // Fallback: old UserTweetsAndReplies endpoint
   try {
     const url = buildUrl(twitterGraphqlEndpoints.UserTweetsAndReplies);
     const params = cloneParams(twitterGraphqlParams.UserTweetsAndReplies, {

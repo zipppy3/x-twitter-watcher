@@ -27,6 +27,16 @@ function isLocalServer() {
 }
 
 /**
+ * Sanitize a thread ID — return it only if it's a valid positive number.
+ * Prevents sending null/undefined/NaN as message_thread_id.
+ */
+function safeThreadId(threadId) {
+  if (!threadId) return null;
+  const n = Number(threadId);
+  return (Number.isFinite(n) && n > 0) ? String(n) : null;
+}
+
+/**
  * Send a Telegram bot notification.
  * Falls back to the public API if the local server is unreachable.
  * 
