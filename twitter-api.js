@@ -8,6 +8,7 @@
  */
 
 const axios = require('axios');
+const { getQueryId } = require('./query-resolver');
 
 // Import the up-to-date constants directly from twspace-crawler
 const { TWITTER_PUBLIC_AUTHORIZATION, UA } = require('twspace-crawler/dist/api/twitter.constant');
@@ -93,6 +94,7 @@ async function getUserTweets(userId, count = 20) {
   if (!headers) return [];
 
   try {
+    // Try twspace-crawler's endpoint first
     const url = buildUrl(twitterGraphqlEndpoints.UserTweets);
     const params = cloneParams(twitterGraphqlParams.UserTweets, {
       variables: { userId, count },
@@ -101,7 +103,25 @@ async function getUserTweets(userId, count = 20) {
     const { data } = await axios.get(url, { headers, params });
     return parseTweetsResponse(data);
   } catch (err) {
-    console.error(`[TwitterAPI] getUserTweets error:`, err.response?.status, err.message);
+    // If stale queryId (404), try dynamic resolution
+    if (err.response?.status === 404) {
+      console.log('[TwitterAPI] Stale UserTweets queryId, resolving dynamically...');
+      try {
+        const freshId = await getQueryId('UserTweets');
+        if (freshId) {
+          const url = `${TWITTER_API_URL}/graphql/${freshId}/UserTweets`;
+          const params = cloneParams(twitterGraphqlParams.UserTweets, {
+            variables: { userId, count },
+          });
+          const { data } = await axios.get(url, { headers, params });
+          return parseTweetsResponse(data);
+        }
+      } catch (err2) {
+        console.error(`[TwitterAPI] getUserTweets dynamic error:`, err2.response?.status, err2.message);
+      }
+    } else {
+      console.error(`[TwitterAPI] getUserTweets error:`, err.response?.status, err.message);
+    }
     return [];
   }
 }
@@ -120,36 +140,31 @@ async function getUserTweetsAndReplies(userId, count = 20) {
   const headers = getAuthHeaders();
   if (!headers) return [];
 
-  // Try V2 endpoint first (uses rest_id param instead of userId)
-  const v2Endpoint = twitterGraphqlEndpoints.UserWithProfileTweetsAndRepliesQueryV2;
-  const v2Params = twitterGraphqlParams.UserWithProfileTweetsAndRepliesQueryV2;
-
-  if (v2Endpoint && v2Params) {
-    try {
-      const url = buildUrl(v2Endpoint);
-      const params = cloneParams(v2Params, {
-        variables: { rest_id: userId },
+  // 1. Try dynamic resolution first (most reliable — live from Twitter's JS)
+  try {
+    const freshId = await getQueryId('UserTweetsAndReplies');
+    if (freshId) {
+      const url = `${TWITTER_API_URL}/graphql/${freshId}/UserTweetsAndReplies`;
+      const params = cloneParams(twitterGraphqlParams.UserTweetsAndReplies, {
+        variables: { userId, count },
       });
-
       const { data } = await axios.get(url, { headers, params });
       return parseTweetsResponse(data);
-    } catch (err) {
-      console.error(`[TwitterAPI] V2 TweetsAndReplies error:`, err.response?.status, err.message);
-      // Fall through to old endpoint
     }
+  } catch (err) {
+    console.error(`[TwitterAPI] Dynamic TweetsAndReplies error:`, err.response?.status, err.message);
   }
 
-  // Fallback: old UserTweetsAndReplies endpoint
+  // 2. Fallback: twspace-crawler's bundled endpoint (may be stale)
   try {
     const url = buildUrl(twitterGraphqlEndpoints.UserTweetsAndReplies);
     const params = cloneParams(twitterGraphqlParams.UserTweetsAndReplies, {
       variables: { userId, count },
     });
-
     const { data } = await axios.get(url, { headers, params });
     return parseTweetsResponse(data);
   } catch (err) {
-    console.error(`[TwitterAPI] getUserTweetsAndReplies error:`, err.response?.status, err.message);
+    console.error(`[TwitterAPI] getUserTweetsAndReplies fallback error:`, err.response?.status, err.message);
     return [];
   }
 }
