@@ -188,30 +188,7 @@ function saveTweet(tweet, username) {
   const jsonPath = path.join(dir, `${baseName}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify(tweet, null, 2), 'utf8');
 
-  // Save TXT (human-readable)
-  const txtPath = path.join(dir, `${baseName}.txt`);
-  const lines = [
-    `Tweet by @${tweet.author?.username || username}`,
-    `Date: ${tweet.createdAt}`,
-    `URL: https://x.com/${tweet.author?.username || username}/status/${tweet.id}`,
-    '',
-    tweet.text,
-    '',
-    `❤ ${tweet.metrics?.likes || 0}  🔁 ${tweet.metrics?.retweets || 0}  💬 ${tweet.metrics?.replies || 0}  👁 ${tweet.metrics?.views || 0}`,
-  ];
-
-  if (tweet.media?.length) {
-    lines.push('', 'Media:');
-    tweet.media.forEach(m => lines.push(`  - [${m.type}] ${m.url}`));
-  }
-
-  if (tweet.quotedTweet) {
-    lines.push('', `Quoting @${tweet.quotedTweet.author?.username}:`, `  "${tweet.quotedTweet.text}"`);
-  }
-
-  fs.writeFileSync(txtPath, lines.join('\n'), 'utf8');
-
-  return { jsonPath, txtPath, dir, baseName };
+  return { jsonPath, dir, baseName };
 }
 
 /**
@@ -230,30 +207,7 @@ function saveThread(tweets, username) {
   const jsonPath = path.join(dir, `${baseName}.json`);
   fs.writeFileSync(jsonPath, JSON.stringify({ thread: tweets, count: tweets.length }, null, 2), 'utf8');
 
-  // Save TXT
-  const txtPath = path.join(dir, `${baseName}.txt`);
-  const lines = [
-    `Thread by @${username} (${tweets.length} tweets)`,
-    `Date: ${firstTweet.createdAt}`,
-    `URL: https://x.com/${username}/status/${tweets[tweets.length - 1].id}`,
-    '',
-    '═'.repeat(50),
-  ];
-
-  tweets.forEach((t, i) => {
-    lines.push(``, `[${i + 1}/${tweets.length}]`, t.text);
-    if (t.media?.length) {
-      t.media.forEach(m => lines.push(`  📎 [${m.type}] ${m.url}`));
-    }
-    lines.push('─'.repeat(50));
-  });
-
-  const lastTweet = tweets[tweets.length - 1];
-  lines.push('', `❤ ${lastTweet.metrics?.likes || 0}  🔁 ${lastTweet.metrics?.retweets || 0}  💬 ${lastTweet.metrics?.replies || 0}`);
-
-  fs.writeFileSync(txtPath, lines.join('\n'), 'utf8');
-
-  return { jsonPath, txtPath, dir, baseName };
+  return { jsonPath, dir, baseName };
 }
 
 /**
@@ -304,7 +258,7 @@ async function processNewTweet(tweet, username, log) {
   log(`📝 New tweet from @${username}: "${tweet.text.substring(0, 60)}..."`);
 
   // Save tweet data
-  const { baseName, dir, jsonPath, txtPath } = saveTweet(tweet, username);
+  const { baseName, dir, jsonPath } = saveTweet(tweet, username);
 
   // Download associated media (images/videos)
   const downloadedMedia = await downloadTweetMedia(tweet, dir, baseName);
@@ -325,7 +279,7 @@ async function processNewTweet(tweet, username, log) {
     `🔗 https://x.com/${username}/status/${tweet.id}`;
 
   // Track all files for potential auto-delete
-  const allFiles = [jsonPath, txtPath];
+  const allFiles = [jsonPath];
   if (screenshotResult) allFiles.push(screenshotResult);
   downloadedMedia.forEach(m => allFiles.push(m.path));
 
@@ -379,7 +333,7 @@ async function processNewTweet(tweet, username, log) {
 async function processThread(threadTweets, username, log) {
   log(`🧵 Thread detected from @${username} (${threadTweets.length} tweets)`);
 
-  const { baseName, dir, jsonPath, txtPath } = saveThread(threadTweets, username);
+  const { baseName, dir, jsonPath } = saveThread(threadTweets, username);
 
   // Download media from all thread tweets
   const allDownloadedMedia = [];
@@ -402,7 +356,7 @@ async function processThread(threadTweets, username, log) {
     `<blockquote>${threadTweets[0].text.substring(0, 200)}${threadTweets[0].text.length > 200 ? '...' : ''}</blockquote>\n` +
     `🔗 https://x.com/${username}/status/${lastTweet.id}`;
 
-  const allFiles = [jsonPath, txtPath];
+  const allFiles = [jsonPath];
   if (screenshotResult) allFiles.push(screenshotResult);
   allDownloadedMedia.forEach(m => allFiles.push(m.path));
 
@@ -488,6 +442,7 @@ async function checkUserTweets(username, log) {
   // Process standalone tweets
   for (const tweet of standaloneTweets) {
     await processNewTweet(tweet, username, log);
+    await new Promise(r => setTimeout(r, 4000)); // Respect Telegram Media upload rate-limits
   }
 
   // Process threads
@@ -496,9 +451,11 @@ async function checkUserTweets(username, log) {
       // Collect the full thread from what we have
       const sorted = threadTweets.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
       await processThread(sorted, username, log);
+      await new Promise(r => setTimeout(r, 6000));
     } else {
       // Single self-reply — treat as standalone for now
       await processNewTweet(threadTweets[0], username, log);
+      await new Promise(r => setTimeout(r, 4000));
     }
   }
 }

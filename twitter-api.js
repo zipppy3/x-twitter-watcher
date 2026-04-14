@@ -101,7 +101,7 @@ async function getUserTweets(userId, count = 20) {
     });
 
     const { data } = await axios.get(url, { headers, params });
-    return parseTweetsResponse(data);
+    return parseTweetsResponse(data, userId);
   } catch (err) {
     // If stale queryId (404), try dynamic resolution
     if (err.response?.status === 404) {
@@ -114,7 +114,7 @@ async function getUserTweets(userId, count = 20) {
             variables: { userId, count },
           });
           const { data } = await axios.get(url, { headers, params });
-          return parseTweetsResponse(data);
+          return parseTweetsResponse(data, userId);
         }
       } catch (err2) {
         console.error(`[TwitterAPI] getUserTweets dynamic error:`, err2.response?.status, err2.message);
@@ -205,7 +205,7 @@ async function getUserTweetsAndReplies(userId, count = 20) {
     // Twitter's endpoint accepts POST for GraphQL and this completely
     // bypasses the 404 / Web Application Firewall blocks that hit URL-encoded GETs!
     const { data } = await axios.post(url, exactParams, { headers });
-    return parseTweetsResponse(data);
+    return parseTweetsResponse(data, userId);
   } catch (err) {
     console.error(`[TwitterAPI] Live TweetsAndReplies error:`, err.response?.status, err.message);
     return [];
@@ -250,8 +250,10 @@ async function getTweetById(tweetId) {
 
 /**
  * Parse the UserTweets GraphQL response into clean tweet objects.
+ * @param {object} data - GraphQL response 
+ * @param {string} targetUserId - Filter out external replies
  */
-function parseTweetsResponse(data) {
+function parseTweetsResponse(data, targetUserId) {
   const tweets = [];
 
   try {
@@ -272,7 +274,7 @@ function parseTweetsResponse(data) {
           if (!result) continue;
           if (result.__typename === 'TweetWithVisibilityResults') result = result.tweet;
           const tweet = parseSingleTweet(result);
-          if (tweet) tweets.push(tweet);
+          if (tweet && (!targetUserId || tweet.authorId === targetUserId)) tweets.push(tweet);
         }
         
         // Threads & Replies are wrapped in TimelineTimelineModule
@@ -283,7 +285,8 @@ function parseTweetsResponse(data) {
             if (!result) continue;
             if (result.__typename === 'TweetWithVisibilityResults') result = result.tweet;
             const tweet = parseSingleTweet(result);
-            if (tweet) tweets.push(tweet);
+            // Ensure the extracted tweet was authored by the user we are tracking
+            if (tweet && (!targetUserId || tweet.authorId === targetUserId)) tweets.push(tweet);
           }
         }
       }
@@ -327,6 +330,7 @@ function parseSingleTweet(result) {
     id: result.rest_id || legacy.id_str,
     text: legacy.full_text,
     createdAt: legacy.created_at,
+    authorId: result.core?.user_results?.result?.rest_id || legacy.user_id_str,
     author: {
       username: user.screen_name,
       displayName: user.name,
