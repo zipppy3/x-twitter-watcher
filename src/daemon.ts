@@ -40,7 +40,9 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
 
   const watchlistService = new WatchlistService(storage);
   const telegramClient = new TelegramBotApiClient(config);
+  const proxyRotator = createProxyRotator(config.proxyEnabled, config.proxyList, config.proxyIsRotatingEndpoint);
   const twitterClient = new TwitterApiClient(config, {
+    proxyRotator,
     onRefreshFailure: async (reason, error) => {
       await telegramClient.sendMessage(
         `<b>⚠ Twitter Auth Failure</b>\n\n` +
@@ -51,7 +53,6 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
       );
     }
   });
-  const proxyRotator = createProxyRotator(config.proxyEnabled, config.proxyList);
   const nitterClient = config.dataSource === 'nitter' ? new NitterApiClient(config, proxyRotator) : null;
   const tweetWorkerClient = nitterClient || twitterClient;
   const screenshotService = new CamoufoxScreenshotService(config, proxyRotator, nitterClient ?? undefined);

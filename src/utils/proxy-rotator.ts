@@ -30,13 +30,15 @@ export class ProxyRotator {
   private readonly logger = rootLogger.child('proxy');
   private readonly proxies: ProxyEntry[] = [];
   private index = 0;
+  private readonly isRotatingEndpoint: boolean;
 
   /** Maximum consecutive failures before skipping a proxy temporarily */
   private static readonly MAX_FAILURES = 5;
   /** Cooldown period after which a failed proxy is retried (ms) */
   private static readonly COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
-  constructor(proxyUrls: string[]) {
+  constructor(proxyUrls: string[], isRotatingEndpoint: boolean = false) {
+    this.isRotatingEndpoint = isRotatingEndpoint;
     for (const raw of proxyUrls) {
       const trimmed = raw.trim();
       if (!trimmed) continue;
@@ -79,6 +81,7 @@ export class ProxyRotator {
 
       // Check if proxy is in cooldown
       if (
+        !this.isRotatingEndpoint &&
         proxy.failureCount >= ProxyRotator.MAX_FAILURES &&
         proxy.lastFailure &&
         now - proxy.lastFailure < ProxyRotator.COOLDOWN_MS
@@ -160,9 +163,9 @@ export class ProxyRotator {
 /**
  * Factory: creates a ProxyRotator if proxy is enabled and the list is non-empty.
  */
-export function createProxyRotator(proxyEnabled: boolean, proxyList: string[]): ProxyRotator {
+export function createProxyRotator(proxyEnabled: boolean, proxyList: string[], isRotatingEndpoint: boolean = false): ProxyRotator {
   if (!proxyEnabled || !proxyList.length) {
     return new ProxyRotator([]);
   }
-  return new ProxyRotator(proxyList);
+  return new ProxyRotator(proxyList, isRotatingEndpoint);
 }

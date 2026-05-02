@@ -30,7 +30,16 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     const url = this.config.dataSource === 'nitter'
       ? `${nitterBase}/${username}/status/${tweetId}`
       : `https://x.com/${username}/status/${tweetId}`;
-    return this.enqueue(() => this.captureUrl(url, outputPath, false, isReply), `tweet ${username}/${tweetId}`);
+      
+    return this.enqueue(async () => {
+      if (!this.config.proxyFallbackOnBan || !this.proxyRotator?.enabled) {
+        return this.captureUrl(url, outputPath, false, isReply, true);
+      }
+      const result = await this.captureUrl(url, outputPath, false, isReply, false);
+      if (result) return result;
+      this.logger.warn('Screenshot failed without proxy, falling back to proxy...', { url });
+      return this.captureUrl(url, outputPath, false, isReply, true);
+    }, `tweet ${username}/${tweetId}`);
   }
 
   async captureThread(username: string, tweetId: string, outputPath: string): Promise<string | null> {
@@ -40,7 +49,16 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     const url = this.config.dataSource === 'nitter'
       ? `${nitterBase}/${username}/status/${tweetId}`
       : `https://x.com/${username}/status/${tweetId}`;
-    return this.enqueue(() => this.captureUrl(url, outputPath, true, false), `thread ${username}/${tweetId}`);
+      
+    return this.enqueue(async () => {
+      if (!this.config.proxyFallbackOnBan || !this.proxyRotator?.enabled) {
+        return this.captureUrl(url, outputPath, true, false, true);
+      }
+      const result = await this.captureUrl(url, outputPath, true, false, false);
+      if (result) return result;
+      this.logger.warn('Screenshot failed without proxy, falling back to proxy...', { url });
+      return this.captureUrl(url, outputPath, true, false, true);
+    }, `thread ${username}/${tweetId}`);
   }
 
   async close(): Promise<void> {
@@ -112,7 +130,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     return false;
   }
 
-  private async captureUrl(url: string, outputPath: string, fullPage: boolean, isReply: boolean): Promise<string | null> {
+  private async captureUrl(url: string, outputPath: string, fullPage: boolean, isReply: boolean, useProxy: boolean): Promise<string | null> {
     const browser = await this.ensureBrowser();
     if (!browser) {
       return null;
@@ -128,7 +146,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         viewport: { width: 800, height: 4000 },
         colorScheme: 'dark',
         locale: 'en-US',
-        ...(this.proxyRotator?.enabled ? { proxy: this.proxyRotator.next() ?? undefined } : {}),
+        ...(useProxy && this.proxyRotator?.enabled ? { proxy: this.proxyRotator.next() ?? undefined } : {}),
       });
       page = await context.newPage();
 

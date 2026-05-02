@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { AppConfig, Tweet, TwitterClient } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { refreshTokensFromProfile } from '../utils/refresh-tokens';
+import { ProxyRotator, PlaywrightProxyConfig } from '../utils/proxy-rotator';
 
 const TWITTER_API_URL = 'https://api.twitter.com';
 const TWITTER_PUBLIC_AUTHORIZATION =
@@ -318,6 +319,7 @@ export class TwitterApiClient implements TwitterClient {
       httpClient?: Pick<AxiosInstance, 'get' | 'post'>;
       refreshHandler?: (reason: string) => Promise<boolean>;
       onRefreshFailure?: (reason: string, error: Error) => Promise<void>;
+      proxyRotator?: ProxyRotator;
     } = {}
   ) {
     this.http = options.httpClient ?? axios.create();
@@ -326,11 +328,29 @@ export class TwitterApiClient implements TwitterClient {
     this.csrfToken = config.twitterCsrfToken;
     this.refreshHandler = options.refreshHandler ?? ((reason) => this.runRefreshScript(reason));
     this.onRefreshFailure = options.onRefreshFailure;
+    this.proxyRotator = options.proxyRotator;
   }
 
   private readonly refreshHandler: (reason: string) => Promise<boolean>;
 
   private readonly onRefreshFailure?: (reason: string, error: Error) => Promise<void>;
+
+  private readonly proxyRotator?: ProxyRotator;
+
+  private getAxiosProxyConfig(proxyConfig: PlaywrightProxyConfig | null): any {
+    if (!proxyConfig) return false;
+    try {
+      const url = new URL(proxyConfig.server);
+      return {
+        protocol: url.protocol.replace(':', ''),
+        host: url.hostname,
+        port: parseInt(url.port || '80', 10),
+        auth: proxyConfig.username ? { username: proxyConfig.username, password: proxyConfig.password || '' } : undefined,
+      };
+    } catch {
+      return false;
+    }
+  }
 
   async resolveUserId(username: string): Promise<string | null> {
     try {
@@ -339,8 +359,8 @@ export class TwitterApiClient implements TwitterClient {
       const params = cloneParams(GRAPHQL_PARAMS.UserByScreenName, {
         variables: { screen_name: username },
       });
-      const { data } = await this.requestWithAuthRetry(() =>
-        this.http.get(url, { headers: this.getAuthHeaders(), params })
+      const { data } = await this.requestWithAuthRetry((proxy) =>
+        this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
       );
       return data?.data?.user?.result?.rest_id || null;
     } catch (error) {
@@ -356,8 +376,8 @@ export class TwitterApiClient implements TwitterClient {
       const params = cloneParams(GRAPHQL_PARAMS.UserTweets, {
         variables: { userId, count },
       });
-      const { data } = await this.requestWithAuthRetry(() =>
-        this.http.get(url, { headers: this.getAuthHeaders(), params })
+      const { data } = await this.requestWithAuthRetry((proxy) =>
+        this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
       );
       return parseTweetsResponse(data, userId);
     } catch (error) {
@@ -370,10 +390,11 @@ export class TwitterApiClient implements TwitterClient {
         const params = cloneParams(GRAPHQL_PARAMS.UserTweets, {
           variables: { userId, count },
         });
-        const { data } = await this.requestWithAuthRetry(() =>
+        const { data } = await this.requestWithAuthRetry((proxy) =>
           this.http.get(`${TWITTER_API_URL}/graphql/${freshId}/UserTweets`, {
             headers: this.getAuthHeaders(),
             params,
+            proxy,
           })
         );
         return parseTweetsResponse(data, userId);
@@ -442,9 +463,10 @@ export class TwitterApiClient implements TwitterClient {
     };
 
     try {
-      const { data } = await this.requestWithAuthRetry(() =>
+      const { data } = await this.requestWithAuthRetry((proxy) =>
         this.http.post(`${TWITTER_API_URL}/graphql/${freshId}/UserTweetsAndReplies`, payload, {
           headers: this.getAuthHeaders(),
+          proxy,
         })
       );
       return parseTweetsResponse(data, userId);
@@ -461,8 +483,8 @@ export class TwitterApiClient implements TwitterClient {
       const params = cloneParams(GRAPHQL_PARAMS.TweetDetail, {
         variables: { focalTweetId: tweetId },
       });
-      const { data } = await this.requestWithAuthRetry(() =>
-        this.http.get(url, { headers: this.getAuthHeaders(), params })
+      const { data } = await this.requestWithAuthRetry((proxy) =>
+        this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
       );
 
       return this.parseTweetDetailResponse(data, tweetId);
@@ -477,10 +499,11 @@ export class TwitterApiClient implements TwitterClient {
             const params = cloneParams(GRAPHQL_PARAMS.TweetDetail, {
               variables: { focalTweetId: tweetId },
             });
-            const { data } = await this.requestWithAuthRetry(() =>
+            const { data } = await this.requestWithAuthRetry((proxy) =>
               this.http.get(`${TWITTER_API_URL}/graphql/${freshId}/TweetDetail`, {
                 headers: this.getAuthHeaders(),
                 params,
+                proxy,
               })
             );
             return this.parseTweetDetailResponse(data, tweetId);
@@ -537,16 +560,26 @@ export class TwitterApiClient implements TwitterClient {
     };
   }
 
-  private async requestWithAuthRetry<T>(request: () => Promise<T>, retried = false): Promise<T> {
+  private async requestWithAuthRetry<T>(request: (proxy: any) => Promise<T>, retried = false, useProxy = false): Promise<T> {
+    const defaultUseProxy = !this.config.proxyFallbackOnBan;
+    const shouldProxy = useProxy || defaultUseProxy;
+    const proxyConfig = shouldProxy && this.proxyRotator?.enabled ? this.getAxiosProxyConfig(this.proxyRotator.next()) : false;
+
     try {
-      return await request();
+      return await request(proxyConfig);
     } catch (error) {
       const axiosError = error as AxiosError;
       const status = axiosError.response?.status;
+
+      if (this.config.proxyFallbackOnBan && !useProxy && (status === 403 || status === 429)) {
+        this.logger.warn(`Twitter API IP banned (${status}), falling back to proxy...`);
+        return this.requestWithAuthRetry(request, retried, true);
+      }
+
       if (!retried && (status === 401 || status === 403)) {
         const refreshed = await this.refreshAuth(`twitter_http_${status}`);
         if (refreshed) {
-          return this.requestWithAuthRetry(request, true);
+          return this.requestWithAuthRetry(request, true, useProxy);
         }
       }
       throw error;

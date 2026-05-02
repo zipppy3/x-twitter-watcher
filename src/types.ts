@@ -16,6 +16,8 @@ export interface AppConfig {
   nitterUrl: string | null;
   nitterFallbackUrls: string[];
   proxyEnabled: boolean;
+  proxyIsRotatingEndpoint: boolean;
+  proxyFallbackOnBan: boolean;
   proxyList: string[];
   telegramBotToken: string | null;
   telegramChatId: string | null;

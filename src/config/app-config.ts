@@ -51,6 +51,8 @@ export function loadAppConfig(options: AppConfigOptions = {}): AppConfig {
       .map((u) => u.trim())
       .filter(Boolean),
     proxyEnabled: parseBoolean(process.env.PROXY_ENABLED, false),
+    proxyIsRotatingEndpoint: parseBoolean(process.env.PROXY_IS_ROTATING_ENDPOINT, false),
+    proxyFallbackOnBan: parseBoolean(process.env.PROXY_FALLBACK_ON_BAN, false),
     proxyList: (readNullableEnv('PROXY_LIST') || '')
       .split(',')
       .map((u) => u.trim())

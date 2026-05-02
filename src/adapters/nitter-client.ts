@@ -25,7 +25,7 @@ export class NitterApiClient implements TwitterClient {
   private static readonly INSTANCE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
   constructor(
-    config: AppConfig,
+    private readonly config: AppConfig,
     proxyRotator?: ProxyRotator,
   ) {
     const primary = config.nitterUrl?.replace(/\/$/, '') || 'https://nitter.net';
@@ -128,13 +128,13 @@ export class NitterApiClient implements TwitterClient {
     return this.browser;
   }
 
-  private async getHtml(url: string): Promise<string> {
+  private async getHtml(url: string, useProxy: boolean): Promise<string> {
     const browser = await this.ensureBrowser();
     if (!browser) throw new Error('Browser unavailable for nitter');
 
     // Build context options with optional proxy
     const contextOptions: any = {};
-    const proxyConfig = this.proxyRotator.next();
+    const proxyConfig = useProxy ? this.proxyRotator.next() : null;
     if (proxyConfig) {
       contextOptions.proxy = proxyConfig;
     }
@@ -186,13 +186,32 @@ export class NitterApiClient implements TwitterClient {
       tried.add(instance.url);
 
       const url = buildUrl(instance.url);
-      try {
-        const html = await this.getHtml(url);
+      
+      const tryFetch = async (useProxy: boolean) => {
+        const html = await this.getHtml(url, useProxy);
         if (!html || html.trim() === '') {
           throw new Error('Nitter returned an empty response');
         }
-        this.markInstanceSuccess(instance);
         return html;
+      };
+
+      try {
+        if (this.config.proxyFallbackOnBan) {
+          try {
+            const html = await tryFetch(false);
+            this.markInstanceSuccess(instance);
+            return html;
+          } catch (error) {
+            this.logger.warn('Nitter direct connection failed, falling back to proxy', { url, message: (error as Error).message });
+            const html = await tryFetch(true);
+            this.markInstanceSuccess(instance);
+            return html;
+          }
+        } else {
+          const html = await tryFetch(true);
+          this.markInstanceSuccess(instance);
+          return html;
+        }
       } catch (error) {
         this.logger.warn('Nitter instance failed, trying fallback', {
           url: instance.url,
