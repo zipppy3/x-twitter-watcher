@@ -11,7 +11,6 @@ const path = require('path');
 const fs = require('fs');
 
 let browser = null;
-let browserContext = null;
 let playwrightAvailable = true;
 
 /**
@@ -22,20 +21,9 @@ async function initBrowser() {
   if (!playwrightAvailable) return false;
 
   try {
-    const { chromium } = require('playwright');
-    browser = await chromium.launch({
+    const { Camoufox } = require('camoufox-js');
+    browser = await Camoufox({
       headless: true,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-      ],
-    });
-    browserContext = await browser.newContext({
-      viewport: { width: 550, height: 900 },
-      colorScheme: 'dark',
-      locale: 'en-US',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     });
     return true;
   } catch (err) {
@@ -49,10 +37,6 @@ async function initBrowser() {
  * Close the shared browser instance.
  */
 async function closeBrowser() {
-  if (browserContext) {
-    await browserContext.close().catch(() => {});
-    browserContext = null;
-  }
   if (browser) {
     await browser.close().catch(() => {});
     browser = null;
@@ -72,15 +56,21 @@ async function screenshotTweet(username, tweetId, outputPath) {
   if (!ready) return null;
 
   const url = `https://x.com/${username}/status/${tweetId}`;
+  let context = null;
   let page = null;
 
   try {
-    page = await browserContext.newPage();
+    context = await browser.newContext({
+      viewport: { width: 800, height: 2000 },
+      colorScheme: 'dark',
+      locale: 'en-US'
+    });
+    page = await context.newPage();
 
     // Block unnecessary resources for speed
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['font', 'media'].includes(type)) {
+      if (['media'].includes(type)) { // Note: 'font' was removed to fix missing Japanese characters / tofu issue
         route.abort();
       } else {
         route.continue();
@@ -104,20 +94,50 @@ async function screenshotTweet(username, tweetId, outputPath) {
       }
     } catch { /* no popup */ }
 
-    // Find the main tweet article (first one is the focal tweet)
-    const tweetElement = page.locator('article[data-testid="tweet"]').first();
-
     // Ensure output directory exists
     const outputDir = path.dirname(outputPath);
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    // Take screenshot of just the tweet element
-    await tweetElement.screenshot({
-      path: outputPath,
-      type: 'png',
+    // Hide any login bars or popups that might overlap before computing bounding box
+    await page.evaluate(() => {
+      document.querySelectorAll('[data-testid="xMigrationBottomBar"], [data-testid="BottomBar"]').forEach(el => el.style.display = 'none');
     });
+
+    // Take a screenshot of all visible tweets combined using bounding box
+    const clip = await page.evaluate(() => {
+        const tweets = Array.from(document.querySelectorAll('article[data-testid="tweet"]')).filter(el => el.offsetHeight > 0);
+        if (tweets.length === 0) return null;
+        let top = Infinity, left = Infinity, bottom = -Infinity, right = -Infinity;
+        tweets.forEach(el => {
+            const cell = el.closest('[data-testid="cellInnerDiv"]') || el;
+            const rect = cell.getBoundingClientRect();
+            if (rect.top < top) top = rect.top;
+            if (rect.left < left) left = rect.left;
+            if (rect.bottom > bottom) bottom = rect.bottom;
+            if (rect.right > right) right = rect.right;
+        });
+        return {
+            x: left + window.scrollX,
+            y: top + window.scrollY,
+            width: right - left,
+            height: bottom - top
+        };
+    });
+
+    if (clip && clip.width > 0 && clip.height > 0) {
+      // Add a tiny bit of padding to the bounding box if we want, or just rely on the cellInnerDiv padding
+      await page.screenshot({ path: outputPath, type: 'png', clip });
+    } else {
+      // Fallback if bounding box failed
+      const fallbackTweet = await page.locator('article[data-testid="tweet"]').first();
+      if (await fallbackTweet.isVisible({ timeout: 2000 }).catch(() => false)) {
+         await fallbackTweet.screenshot({ path: outputPath, type: 'png' });
+      } else {
+         await page.screenshot({ path: outputPath, type: 'png' }); // last resort
+      }
+    }
 
     return outputPath;
   } catch (err) {
@@ -125,6 +145,7 @@ async function screenshotTweet(username, tweetId, outputPath) {
     return null;
   } finally {
     if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
   }
 }
 
@@ -142,14 +163,20 @@ async function screenshotThread(username, tweetId, outputPath) {
   if (!ready) return null;
 
   const url = `https://x.com/${username}/status/${tweetId}`;
+  let context = null;
   let page = null;
 
   try {
-    page = await browserContext.newPage();
+    context = await browser.newContext({
+      viewport: { width: 800, height: 2000 },
+      colorScheme: 'dark',
+      locale: 'en-US'
+    });
+    page = await context.newPage();
 
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['font', 'media'].includes(type)) {
+      if (['media'].includes(type)) { // Note: 'font' was removed to fix missing Japanese characters / tofu issue
         route.abort();
       } else {
         route.continue();
@@ -187,6 +214,7 @@ async function screenshotThread(username, tweetId, outputPath) {
     return null;
   } finally {
     if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
   }
 }
 

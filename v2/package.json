@@ -1,0 +1,39 @@
+{
+  "name": "space-watcher-v2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript rewrite of the X/Twitter watcher",
+  "type": "commonjs",
+  "main": "dist/cli.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "migrate:v1": "tsx src/cli.ts migrate:v1",
+    "start": "node dist/cli.js start",
+    "stop": "node dist/cli.js stop",
+    "status": "node dist/cli.js status",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "axios": "^1.14.0",
+    "better-sqlite3": "^11.10.0",
+    "camoufox-js": "^0.10.0",
+    "cheerio": "^1.2.0",
+    "commander": "^13.1.0",
+    "dotenv": "^17.4.0",
+    "form-data": "^4.0.5",
+    "node-telegram-bot-api": "^0.67.0",
+    "twspace-crawler": "1.18.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.19.0",
+    "@types/node-telegram-bot-api": "^0.64.9",
+    "tsx": "^4.19.4",
+    "typescript": "^5.9.2",
+    "vitest": "^2.1.8"
+  }
+}

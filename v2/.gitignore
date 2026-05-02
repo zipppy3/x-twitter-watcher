@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+logs/
+download/
+.env
+.browser-profile/
+*.pid
