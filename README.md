@@ -1,107 +1,99 @@
-<div align="center">
+# X/Twitter Watcher
 
-# X/Twitter Watcher Framework (v2)
+A robust, TypeScript-based daemon for monitoring X (Twitter) accounts for live Spaces and new Tweets. It automatically downloads recordings, media, and screenshots, and seamlessly uploads them to Telegram using a local bot API.
 
-![Version](https://img.shields.io/badge/version-2.0-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+## Features
 
-A robust, 24/7 automated monitoring and archival daemon for X (Twitter) Spaces AND Tweets. Designed with stealth parsing and built for both personal desktop storage and headless server deployments.
+- **Space Monitoring:** Detects when watched users go live, records the Space audio, and downloads metadata.
+- **Tweet Monitoring:** Polls for new tweets and replies, downloads media, captures screenshots of the thread, and saves JSON metadata.
+- **Telegram Integration:** Uploads all captured artifacts directly to Telegram topics, circumventing the 50MB file limit using a local bot API.
+- **Resilient Polling:** Includes intelligent backoff, error handling, and `camoufox-js`/`twspace-crawler` integration to bypass anti-bot mechanisms.
+- **Nitter Integration:** Optional fallback to Nitter for tweet polling to bypass Twitter's aggressive rate limiting and anti-bot challenges.
+- **Proxy Support:** Rotating HTTP/S proxy integration for both API requests and browser-based screenshot captures to prevent IP bans.
+- **Database Backend:** Uses SQLite (via `better-sqlite3`) to maintain state, watchlists, and deduplication records.
 
-*Disclosure: This project is vibecoded.*
+## Setup Instructions
 
-</div>
+### 1. Prerequisites
+- Node.js (>= 22.0.0)
+- npm or yarn
+- Docker (optional, but highly recommended for the Telegram Bot API server)
 
----
-
-## 🚀 Features
-
-* **Vibecoded Architecture:** Completely rewritten in TypeScript with a hardened SQLite backend (`better-sqlite3`), dropping fragile JSON states for rigid concurrency.
-* **Stealth Screenshot Archiving:** Utilizes `camoufox-js` to bypass Twitter's aggressive Cloudflare WAF protections. Prevents 503 errors and fingerprinting blocks while scraping timelines.
-* **Dynamic GraphQL Resolver:** Automatically fetches live `.js` frontend bundles to extract the latest internal Twitter Query IDs, making it immune to arbitrary 404 endpoint changes.
-* **Headless Daemon Mode:** Runs flawlessly in the background using native detached Node processes. Survives terminal closures and system reboots without requiring third-party tools like PM2.
-* **Full Tweet & Media Archiving:** Monitors timelines and automatically downloads tweets, JSON metadata, photos, and standardizes multi-video tweets into grouped Telegram albums.
-* **Interactive Telegram Bot:** Add users, remove users, check system status, or `/delete` local storage directly from your phone.
-* **Auto-Refreshing Tokens:** Includes a Playwright-powered script to automatically launch a browser profile, extract fresh cookies, and completely update your configuration if your Twitter session drops organically without skipping a beat.
-
----
-
-## 🛠️ Installation
-
-### Prerequisites
-1. **Node.js** (v22 or higher recommended)
-2. **FFmpeg** (must be installed and accessible in your system `PATH`)
-3. **Docker** (optional — only needed to bypass Telegram's 50MB upload limit)
-
-### 1. Clone the repository
+### 2. Installation
+Clone the repository and install dependencies:
 ```bash
-git clone https://github.com/zipppy3/x-space-watcher.git
-cd x-space-watcher/v2
+git clone <repo-url>
+cd space-watcher/v2
 npm install
+```
+
+### 3. Configuration
+Copy the environment template and configure your tokens:
+```bash
+cp .env.example .env
+```
+Fill out the required tokens in `.env`. You can also run the interactive setup wizard:
+```bash
+npm run dev setup
+```
+
+#### 4. Running the Watcher
+
+The watcher can be run using the source code (for development) or the compiled code (for stability).
+
+#### Using Source Code (Development)
+Good for testing changes immediately.
+```bash
+# Foreground / Interactive mode
+npm run dev -- start --foreground
+
+# Background mode
+npm run dev -- start
+```
+
+#### Using Compiled Code (Production)
+Recommended for daily use. Ensure you build first.
+```bash
 npm run build
-```
 
----
-
-## ⚙️ Configuration & Usage
-
-The application provides a built-in CLI wizard to handle all configuration for you. Ensure you are running these commands inside the `v2/` directory!
-
-### 1. Initial Setup
-Run the setup wizard to easily securely inject your tokens:
-```bash
-npm run start setup
-```
-1. It will ask for your Twitter `auth_token` and `ct0` cookies (grabbed from X.com Developer Tools -> Application -> Cookies).
-2. It will prompt for your Telegram Bot tokens and Chat IDs.
-3. It will securely output everything to your local `.env`.
-
-### 2. Auto-Token Refresh (Important!)
-To ensure the watcher can heal itself when Twitter forcefully expires your cookies, you must create a persistent browser profile manually once:
-```bash
-npx playwright install chromium
-node refresh_tokens.js --setup
-```
-*A visible browser will open. Log in to Twitter manually and close the browser. Your encrypted session will be saved securely in `.browser-profile/`.*
-
-### 3. Start Watching!
-To launch the daemon, just run:
-```bash
+# Background mode (default)
 npm run start
+
+# Foreground / Interactive mode
+npm run start -- --foreground
 ```
-The CLI will ask you to choose a mode:
-1. **Minimalistic**: Disconnects from the terminal and runs silently in the background forever.
-2. **Interactive**: Boots up locally in your foreground with full live log outputs.
 
-### Additional Commands
+> [!TIP]
+> Use the `--` separator when running via `npm run` to ensure flags like `--foreground` are passed correctly to the application.
 
-| Command | Description |
-|---|---|
-| `npm run start` | General command to launch the app |
-| `npm run start add <username>` | Adds a user to watchlist (flags: `--tweets`, `--spaces`, `--replies`) |
-| `npm run start stop` | Safely stops the background daemon |
-| `npm run start status` | Shows an overview of monitor status, uptime, and database records |
-| `npm run start switch` | Instantly swaps the watcher between Background detached and Foreground modes |
-| `npm run start update` | Automatically runs `git pull`, updates packages, and installs browsers |
-| `npm run start update-tokens` | Manually overwrites your Twitter cookies in `.env` |
+## Docker Setup (Telegram Bot API)
 
----
+To upload Space recordings or videos larger than 50MB, you must run a local Telegram Bot API server.
 
-## 💬 Telegram Notifications & 50MB Bypass
+1. Obtain your API ID and API Hash from [my.telegram.org](https://my.telegram.org).
+2. Edit `.env` to include `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
+3. Set `TELEGRAM_API_URL=http://127.0.0.1:8081`.
+4. Start the Docker container:
+```bash
+docker compose up -d
+```
 
-During `setup`, you can map specific **Topic Thread IDs** inside a Telegram Group to neatly organize your Spaces Audio, Metadata, and Tweet Screenshots.
+## Advanced Configuration
 
-### ⚠️ Bypassing Telegram's 50MB File Limit
-The public Telegram Bot API rejects files larger than 50MB (breaking lengthy Spaces backups). We include a config to connect to a Local Bot API Server.
+### Nitter Integration
 
-1. Go to [`my.telegram.org`](https://my.telegram.org) and get your `API_ID` and `API_HASH`.
-2. Provide them during the `npm run start setup` wizard.
-3. Drop a `docker-compose.yml` configured for `aiogram/telegram-bot-api` in your directory and start the local server:
-   ```bash
-   docker compose up -d
-   ```
-The watcher automatically routes files up to 2GB through `http://127.0.0.1:8081`.
+If you encounter severe rate limits or blocks on the official Twitter API, you can switch to Nitter for tweet polling:
+- Set `DATA_SOURCE=nitter` in your `.env`.
+- Configure `NITTER_URL` with your preferred instance.
+- Provide a comma-separated list of `NITTER_FALLBACK_URLS` for automatic failover if the primary instance is down.
 
----
+### Proxy Support
 
-## ⚖️ License
-This project is open-sourced under the MIT License. See `LICENSE` for details.
+To further enhance reliability and prevent IP-based banning:
+- Set `PROXY_ENABLED=true` in your `.env`.
+- Add your proxy URLs (format: `http://user:pass@host:port`) to `PROXY_LIST`, separated by commas.
+- The system will automatically rotate through these proxies for scraping and screenshot operations.
+
+## Documentation
+
+- **[Runbook](./Runbook.md):** Detailed guide on operations, CLI commands, database migrations, and troubleshooting.

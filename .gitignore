@@ -1,29 +1,8 @@
-# Environment Variables
-.env
-
-# Dependencies
 node_modules/
-
-# Runtime State & Logs
+dist/
+data/
 logs/
-.watcher-state.json
-.*_all.log
-.*_error.log
-update.log
-
-# Dynamic State Files
-watchlist.json
-seen-tweets.json
-
-# Playwright Browser Profile
-# (This contains your active session cookies, NEVER commit this)
-.browser-profile/
-
-# Downloads directory
 download/
-downloads/
-media/
-
-# OS Files
-.DS_Store
-Thumbs.db
+.env
+.browser-profile/
+*.pid
