@@ -563,11 +563,20 @@ export class TwitterApiClient implements TwitterClient {
   private async requestWithAuthRetry<T>(request: (proxy: any) => Promise<T>, retried = false, useProxy = false): Promise<T> {
     const defaultUseProxy = !this.config.proxyFallbackOnBan;
     const shouldProxy = useProxy || defaultUseProxy;
-    const proxyConfig = shouldProxy && this.proxyRotator?.enabled ? this.getAxiosProxyConfig(this.proxyRotator.next()) : false;
+    const rawProxy = shouldProxy && this.proxyRotator?.enabled ? this.proxyRotator.next() : null;
+    const proxyConfig = rawProxy ? this.getAxiosProxyConfig(rawProxy) : false;
 
     try {
-      return await request(proxyConfig);
+      const result = await request(proxyConfig);
+      if (rawProxy && this.proxyRotator) {
+        this.proxyRotator.markSuccess(rawProxy.server);
+      }
+      return result;
     } catch (error) {
+      if (rawProxy && this.proxyRotator) {
+        this.proxyRotator.markFailed(rawProxy.server);
+      }
+
       const axiosError = error as AxiosError;
       const status = axiosError.response?.status;
 

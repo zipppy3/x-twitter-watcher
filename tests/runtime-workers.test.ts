@@ -1,5 +1,14 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, test, vi } from 'vitest';
+
+vi.mock('../src/utils/async', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../src/utils/async')>();
+  return {
+    ...mod,
+    randomSleep: vi.fn().mockResolvedValue(undefined),
+    sleep: vi.fn().mockResolvedValue(undefined),
+  };
+});
 import { SpaceMonitorWorker } from '../src/core/space-monitor-worker';
 import { TweetMonitorWorker } from '../src/core/tweet-monitor-worker';
 import { SqliteStorage } from '../src/storage/sqlite-storage';

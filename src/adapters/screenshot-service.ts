@@ -4,7 +4,7 @@ import { Camoufox } from 'camoufox-js';
 import { AppConfig, ScreenshotService } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { ensureFileDir } from '../utils/files';
-import { withTimeout } from '../utils/async';
+import { withTimeout, Semaphore } from '../utils/async';
 import { ProxyRotator } from '../utils/proxy-rotator';
 import { NitterApiClient } from './nitter-client';
 
@@ -13,7 +13,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
 
   private browser: any | null = null;
 
-  private queue: Promise<void> = Promise.resolve();
+  private semaphore = new Semaphore(4);
 
   private available = true;
 
@@ -80,9 +80,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       return result;
     };
 
-    const next = this.queue.then(run, run);
-    this.queue = next.then(() => undefined, () => undefined);
-    return next;
+    return this.semaphore.run(run);
   }
 
   private async ensureBrowser(): Promise<any | null> {
@@ -108,7 +106,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
    * This prevents capturing tiny/broken screenshots when the page hasn't finished
    * rendering (e.g. during the Nitter browser-verification challenge).
    */
-  private async waitForNitterElementReady(page: any, selector: string, maxRetries = 10): Promise<boolean> {
+  private async waitForNitterElementReady(page: any, selector: string, maxRetries = 25): Promise<boolean> {
     for (let i = 0; i < maxRetries; i++) {
       const dims = await page.evaluate((sel: string) => {
         const el = document.querySelector(sel);
@@ -123,7 +121,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       }
 
       this.logger.info(`Waiting for Nitter element to render: ${selector} (attempt ${i + 1}/${maxRetries})`, { dims });
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(200);
     }
 
     this.logger.warn(`Nitter element did not reach expected dimensions: ${selector}`);
@@ -139,23 +137,40 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     let context: any;
     let page: any;
 
+    let proxyConfig: any = null;
+
     try {
       const isNitter = this.config.dataSource === 'nitter';
+      proxyConfig = useProxy && this.proxyRotator?.enabled ? this.proxyRotator.next() : null;
 
       context = await browser.newContext({
         viewport: { width: 800, height: 4000 },
         colorScheme: 'dark',
         locale: 'en-US',
-        ...(useProxy && this.proxyRotator?.enabled ? { proxy: this.proxyRotator.next() ?? undefined } : {}),
+        ...(proxyConfig ? { proxy: proxyConfig } : {}),
       });
       page = await context.newPage();
 
       const tweetSelector = isNitter ? '.main-tweet' : 'article[data-testid="tweet"]';
 
-      await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector(tweetSelector, { timeout: 15000 });
 
-      await page.waitForTimeout(fullPage ? 3000 : 2000);
+      // Wait for images to load (prevents gray circle profile pictures)
+      await Promise.race([
+        page.evaluate(() => {
+          return Promise.all(
+            Array.from(document.images)
+              .filter(img => !img.complete)
+              .map(img => new Promise(resolve => {
+                img.onload = img.onerror = resolve;
+              }))
+          );
+        }),
+        page.waitForTimeout(5000)
+      ]).catch(() => undefined);
+
+      await page.waitForTimeout(fullPage ? 1500 : 500);
 
       ensureFileDir(outputPath);
 
@@ -171,7 +186,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
           { display: none !important; }
         `});
 
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(100);
 
         // Determine the screenshot target:
         // 1. If this is a reply by the watched user, use .main-thread to capture
@@ -203,6 +218,10 @@ export class CamoufoxScreenshotService implements ScreenshotService {
           quality: 85,
         });
 
+        if (proxyConfig && this.proxyRotator) {
+          this.proxyRotator.markSuccess(proxyConfig.server);
+        }
+
         return outputPath;
       }
 
@@ -212,7 +231,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
           const showMore = page.locator('span:has-text("Show more"), [data-testid="tweetText"] div[role="button"]');
           if (await showMore.first().isVisible({ timeout: 1000 })) {
             await showMore.first().click();
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(500);
           }
         } catch {
           // Ignore missing "Show more".
@@ -248,6 +267,9 @@ export class CamoufoxScreenshotService implements ScreenshotService {
 
       if (fullPage) {
         await page.screenshot({ path: outputPath, type: 'jpeg', quality: 85, fullPage: true });
+        if (proxyConfig && this.proxyRotator) {
+          this.proxyRotator.markSuccess(proxyConfig.server);
+        }
         return outputPath;
       }
 
@@ -292,8 +314,15 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         await page.locator(tweetSelector).first().screenshot({ path: outputPath, type: 'jpeg', quality: 85 });
       }
 
+      if (proxyConfig && this.proxyRotator) {
+        this.proxyRotator.markSuccess(proxyConfig.server);
+      }
+
       return outputPath;
     } catch (error) {
+      if (proxyConfig && this.proxyRotator) {
+        this.proxyRotator.markFailed(proxyConfig.server);
+      }
       this.logger.warn('Failed to capture screenshot', { url, message: (error as Error).message });
       return null;
     } finally {
