@@ -1,5 +1,5 @@
 {
-  "name": "space-watcher-v2",
+  "name": "watcher",
   "version": "0.1.0",
   "private": true,
   "description": "TypeScript rewrite of the X/Twitter watcher",

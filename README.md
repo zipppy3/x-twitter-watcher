@@ -1,5 +1,8 @@
 # X/Twitter Watcher
 
+> [!NOTE]
+> This project was vibe coded. 🎵✨
+
 A robust, TypeScript-based daemon for monitoring X (Twitter) accounts for live Spaces and new Tweets. It automatically downloads recordings, media, and screenshots, and seamlessly uploads them to Telegram using a local bot API.
 
 ## Features
