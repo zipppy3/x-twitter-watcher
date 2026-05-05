@@ -398,7 +398,7 @@ async function cmdSetup(options: { env?: string }) {
     if (apiHash) updateEnvKey(config.envPath, 'TELEGRAM_API_HASH', apiHash);
 
     if (apiId && apiHash) {
-      updateEnvKey(config.envPath, 'TELEGRAM_API_URL', 'http://127.0.0.1:8081');
+      updateEnvKey(config.envPath, 'TELEGRAM_API_URL', 'http://127.0.0.1:9201');
       console.log(c.gray('\n  To start the local server, run:'));
       console.log(c.cyanBold('    docker compose up -d\n'));
     }

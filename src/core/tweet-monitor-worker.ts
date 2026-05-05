@@ -305,22 +305,22 @@ export class TweetMonitorWorker {
     }
   }
 
-  private saveTweet(tweet: Tweet, username: string): { jsonPath: string; dir: string; baseName: string } {
-    const dir = path.join(this.config.downloadRoot, username, 'tweets');
+  private saveTweet(tweet: Tweet, username: string): { jsonPath: string; baseDir: string; baseName: string } {
+    const baseDir = path.join(this.config.downloadRoot, username, 'tweets');
     const baseName = `[${username}][${getTimestamp(tweet.createdAt)}] ${truncateForFilename(tweet.text)}`;
-    const jsonPath = path.join(dir, `${baseName}.json`);
+    const jsonPath = path.join(baseDir, 'json', `${baseName}.json`);
     ensureFileDir(jsonPath);
     fs.writeFileSync(jsonPath, JSON.stringify(tweet, null, 2), 'utf8');
-    return { jsonPath, dir, baseName };
+    return { jsonPath, baseDir, baseName };
   }
 
-  private saveThread(tweets: Tweet[], username: string): { jsonPath: string; dir: string; baseName: string } {
-    const dir = path.join(this.config.downloadRoot, username, 'tweets');
+  private saveThread(tweets: Tweet[], username: string): { jsonPath: string; baseDir: string; baseName: string } {
+    const baseDir = path.join(this.config.downloadRoot, username, 'tweets');
     const baseName = `[${username}][${getTimestamp(tweets[0].createdAt)}] THREAD - ${truncateForFilename(tweets[0].text)}`;
-    const jsonPath = path.join(dir, `${baseName}.json`);
+    const jsonPath = path.join(baseDir, 'json', `${baseName}.json`);
     ensureFileDir(jsonPath);
     fs.writeFileSync(jsonPath, JSON.stringify({ thread: tweets, count: tweets.length }, null, 2), 'utf8');
-    return { jsonPath, dir, baseName };
+    return { jsonPath, baseDir, baseName };
   }
 
   private async downloadMedia(url: string, outputPath: string): Promise<string | null> {
@@ -348,8 +348,9 @@ export class TweetMonitorWorker {
     }
   }
 
-  private async downloadTweetMedia(tweet: Tweet, dir: string, baseName: string): Promise<TelegramMediaItem[]> {
+  private async downloadTweetMedia(tweet: Tweet, baseDir: string, baseName: string): Promise<TelegramMediaItem[]> {
     const downloadedMedia: TelegramMediaItem[] = [];
+    const mediaDir = path.join(baseDir, 'media');
 
     const allMedia = [...(tweet.media || [])];
     if (tweet.quotedTweet && tweet.quotedTweet.media) {
@@ -368,7 +369,7 @@ export class TweetMonitorWorker {
         mediaUrl = `${normalized}?format=jpg&name=orig`;
       }
 
-      const filePath = path.join(dir, `${baseName}_media${index + 1}${extension}`);
+      const filePath = path.join(mediaDir, `${baseName}_media${index + 1}${extension}`);
       const saved = await this.downloadMedia(mediaUrl, filePath);
       if (saved) {
         downloadedMedia.push({
@@ -400,27 +401,27 @@ export class TweetMonitorWorker {
   private async processNewTweet(tweet: Tweet, target: WatchTarget): Promise<void> {
     // Save metadata JSON to disk (if enabled)
     let jsonPath: string | null = null;
-    let dir: string;
+    let baseDir: string;
     let baseName: string;
 
     if (target.saveMetadata) {
       const saved = this.saveTweet(tweet, target.username);
       jsonPath = saved.jsonPath;
-      dir = saved.dir;
+      baseDir = saved.baseDir;
       baseName = saved.baseName;
     } else {
-      // Still need dir/baseName for media and screenshots
-      dir = path.join(this.config.downloadRoot, target.username, 'tweets');
+      // Still need baseDir/baseName for media and screenshots
+      baseDir = path.join(this.config.downloadRoot, target.username, 'tweets');
       baseName = `[${target.username}][${getTimestamp(tweet.createdAt)}] ${truncateForFilename(tweet.text)}`;
     }
 
     // Download media (if enabled)
-    const media = target.saveMedia ? await this.downloadTweetMedia(tweet, dir, baseName) : [];
+    const media = target.saveMedia ? await this.downloadTweetMedia(tweet, baseDir, baseName) : [];
 
     // Capture screenshot (if enabled)
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
-      const screenshotPath = path.join(dir, `${baseName}.jpg`);
+      const screenshotPath = path.join(baseDir, 'screenshots', `${baseName}.jpg`);
 
       // Detect if this is a reply made BY the watched user
       const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username === target.username);
@@ -460,7 +461,7 @@ export class TweetMonitorWorker {
     // full conversation (parent tweets + reply), so skip the separate parent screenshot.
     let parentScreenshotResult: string | null = null;
     if (target.saveScreenshots && tweet.inReplyToTweet && !isReplyByWatchedUser) {
-      const parentScreenshotPath = path.join(dir, `${baseName}_parent.jpg`);
+      const parentScreenshotPath = path.join(baseDir, 'screenshots', `${baseName}_parent.jpg`);
       parentScreenshotResult = await this.screenshotService.captureTweet(
         tweet.inReplyToTweet.author.username || target.username, 
         tweet.inReplyToTweet.id, 
@@ -516,16 +517,16 @@ export class TweetMonitorWorker {
 
   private async processThread(tweets: Tweet[], target: WatchTarget): Promise<void> {
     let jsonPath: string | null = null;
-    let dir: string;
+    let baseDir: string;
     let baseName: string;
 
     if (target.saveMetadata) {
       const saved = this.saveThread(tweets, target.username);
       jsonPath = saved.jsonPath;
-      dir = saved.dir;
+      baseDir = saved.baseDir;
       baseName = saved.baseName;
     } else {
-      dir = path.join(this.config.downloadRoot, target.username, 'tweets');
+      baseDir = path.join(this.config.downloadRoot, target.username, 'tweets');
       baseName = `[${target.username}][${getTimestamp(tweets[0].createdAt)}] THREAD - ${truncateForFilename(tweets[0].text)}`;
     }
 
@@ -535,7 +536,7 @@ export class TweetMonitorWorker {
 
     if (target.saveMedia) {
       for (const tweet of tweets) {
-        const downloaded = await this.downloadTweetMedia(tweet, dir, baseName);
+        const downloaded = await this.downloadTweetMedia(tweet, baseDir, baseName);
         for (const item of downloaded) {
           mediaItems.push(item);
           allFiles.push(item.path);
@@ -546,7 +547,7 @@ export class TweetMonitorWorker {
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
       const lastTweet = tweets[tweets.length - 1];
-      const screenshotPath = path.join(dir, `${baseName}.jpg`);
+      const screenshotPath = path.join(baseDir, 'screenshots', `${baseName}.jpg`);
       screenshotResult = await this.screenshotService.captureThread(target.username, lastTweet.id, screenshotPath);
 
       // Fallback: if the screenshot timed out but the file was written to disk, use it
@@ -561,7 +562,7 @@ export class TweetMonitorWorker {
 
     let parentScreenshotResult: string | null = null;
     if (target.saveScreenshots && tweets[0].inReplyToTweet) {
-      const parentScreenshotPath = path.join(dir, `${baseName}_parent.jpg`);
+      const parentScreenshotPath = path.join(baseDir, 'screenshots', `${baseName}_parent.jpg`);
       parentScreenshotResult = await this.screenshotService.captureTweet(
         tweets[0].inReplyToTweet.author.username || target.username, 
         tweets[0].inReplyToTweet.id, 

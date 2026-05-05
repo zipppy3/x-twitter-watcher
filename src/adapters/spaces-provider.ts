@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { AppConfig, SpacesProvider, SpacesProviderEvents, SpaceRecordedEvent, WatchTarget } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { formatDuration } from '../utils/time';
-import { sanitizeFilename } from '../utils/files';
+import { ensureFileDir, sanitizeFilename } from '../utils/files';
 
 // twspace-crawler is intentionally isolated to this adapter.
 const { SpaceWatcher } = require('twspace-crawler/dist/modules/SpaceWatcher');
@@ -16,15 +16,15 @@ const { TWITTER_PUBLIC_AUTHORIZATION } = require('twspace-crawler/dist/constants
 
 type SpaceWatcherInstance = InstanceType<typeof SpaceWatcher>;
 
-function writeSpeakersMetadata(watcher: SpaceWatcherInstance): string | null {
+function writeSpeakersMetadata(watcher: SpaceWatcherInstance, downloadRoot: string): string | null {
   const username = watcher.space?.creator?.username;
   if (!username) {
     return null;
   }
 
-  const dir = Util.getMediaDir(username);
-  Util.createMediaDir(username);
-  const filePath = path.join(dir, `${sanitizeFilename(watcher.filename)} - speakers.txt`);
+  const metadataDir = path.join(downloadRoot, username, 'spaces', 'metadata');
+  const filePath = path.join(metadataDir, `${sanitizeFilename(watcher.filename)} - speakers.txt`);
+  ensureFileDir(filePath);
   const participants = watcher.audioSpace?.participants;
 
   const lines = [
@@ -264,10 +264,28 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
   }
 
   private buildRecordedEvent(spaceId: string, watcher: SpaceWatcherInstance): SpaceRecordedEvent | null {
-    const filePath = watcher.downloader?.resultFile;
+    const originalFilePath = watcher.downloader?.resultFile;
     const username = watcher.space?.creator?.username || 'unknown';
-    if (!filePath) {
+    if (!originalFilePath) {
       return null;
+    }
+
+    // Move the recorded audio file into the per-user directory structure
+    const audioDir = path.join(this.config.downloadRoot, username, 'spaces', 'audio');
+    const audioFileName = path.basename(originalFilePath);
+    const finalFilePath = path.join(audioDir, audioFileName);
+    try {
+      ensureFileDir(finalFilePath);
+      fs.renameSync(originalFilePath, finalFilePath);
+    } catch {
+      // If rename fails (cross-device), try copy + delete
+      try {
+        fs.copyFileSync(originalFilePath, finalFilePath);
+        fs.rmSync(originalFilePath, { force: true });
+      } catch {
+        // Fall back to original path if move fails entirely
+        return this.buildRecordedEventFallback(spaceId, watcher, originalFilePath);
+      }
     }
 
     const durationMs =
@@ -275,7 +293,27 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
         ? Number(watcher.space.endedAt) - Number(watcher.space.startedAt)
         : 0;
 
-    const metadataPath = writeSpeakersMetadata(watcher);
+    const metadataPath = writeSpeakersMetadata(watcher, this.config.downloadRoot);
+
+    return {
+      spaceId,
+      title: watcher.space?.title || 'Untitled Space',
+      user: username,
+      duration: formatDuration(durationMs),
+      filePath: finalFilePath,
+      metadataPath,
+      recordedAt: new Date().toISOString(),
+    };
+  }
+
+  private buildRecordedEventFallback(spaceId: string, watcher: SpaceWatcherInstance, filePath: string): SpaceRecordedEvent {
+    const username = watcher.space?.creator?.username || 'unknown';
+    const durationMs =
+      watcher.space?.endedAt && watcher.space?.startedAt
+        ? Number(watcher.space.endedAt) - Number(watcher.space.startedAt)
+        : 0;
+
+    const metadataPath = writeSpeakersMetadata(watcher, this.config.downloadRoot);
 
     return {
       spaceId,

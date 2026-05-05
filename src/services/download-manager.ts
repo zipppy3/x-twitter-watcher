@@ -10,6 +10,19 @@ export interface DeleteResult {
   freedBytes: number;
 }
 
+/**
+ * Delete downloaded files for a user.
+ *
+ * Directory structure (per-user):
+ *   {downloadRoot}/{username}/
+ *     tweets/
+ *       json/          – tweet metadata JSON files
+ *       screenshots/   – tweet screenshot images
+ *       media/         – downloaded images & videos
+ *     spaces/
+ *       audio/         – space recordings (.m4a)
+ *       metadata/      – speaker lists (.txt)
+ */
 export function deleteUserDownloads(downloadRoot: string, username: string, target: DeleteTarget): DeleteResult {
   const normalized = normalizeUsername(username);
   const userDir = path.join(downloadRoot, normalized);
@@ -28,23 +41,36 @@ export function deleteUserDownloads(downloadRoot: string, username: string, targ
   if (target === 'spaces') {
     let deletedCount = 0;
     let freedBytes = 0;
-    for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
-      // Skip the tweets subdirectory — that belongs to the tweets target
-      if (entry.isDirectory() && entry.name === 'tweets') {
-        continue;
-      }
-      const fullPath = path.join(userDir, entry.name);
-      if (entry.isDirectory()) {
-        const stats = getDirSize(fullPath);
-        deletedCount += stats.files;
-        freedBytes += stats.bytes;
-        fs.rmSync(fullPath, { recursive: true, force: true });
-      } else {
-        freedBytes += fs.statSync(fullPath).size;
-        fs.rmSync(fullPath, { force: true });
-        deletedCount += 1;
+
+    // Delete the new structured spaces/ directory
+    const spacesDir = path.join(userDir, 'spaces');
+    if (fs.existsSync(spacesDir)) {
+      const stats = getDirSize(spacesDir);
+      deletedCount += stats.files;
+      freedBytes += stats.bytes;
+      fs.rmSync(spacesDir, { recursive: true, force: true });
+    }
+
+    // Also clean up any legacy files at the user root (non-tweets directories and loose files)
+    if (fs.existsSync(userDir)) {
+      for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
+        if (entry.name === 'tweets' || entry.name === 'spaces') {
+          continue;
+        }
+        const fullPath = path.join(userDir, entry.name);
+        if (entry.isDirectory()) {
+          const stats = getDirSize(fullPath);
+          deletedCount += stats.files;
+          freedBytes += stats.bytes;
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        } else {
+          freedBytes += fs.statSync(fullPath).size;
+          fs.rmSync(fullPath, { force: true });
+          deletedCount += 1;
+        }
       }
     }
+
     return { deletedCount, freedBytes };
   }
 
