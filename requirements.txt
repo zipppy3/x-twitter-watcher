@@ -1,0 +1,7 @@
+# Python side of the watcher: the official Camoufox package drives the browser
+# used for tweet screenshots and Nitter scraping.
+#
+# playwright here and playwright-core in package.json must stay on the same
+# minor version (the Node client connects to the server this package launches).
+camoufox[geoip]==0.5.7
+playwright==1.62.*

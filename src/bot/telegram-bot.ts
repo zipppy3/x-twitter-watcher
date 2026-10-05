@@ -1,4 +1,4 @@
-import TelegramBot from 'node-telegram-bot-api';
+import { Bot } from 'node-telegram-bot-api';
 import { AppConfig, WatcherStatus } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { deleteUserDownloads, DeleteTarget } from '../services/download-manager';
@@ -18,10 +18,13 @@ function parseAddMode(args: string[]): { mode: 'all' | 'spaces' | 'tweets'; watc
   };
 }
 
+/** Sends an HTML reply into the chat (and forum topic) the command came from. */
+type Reply = (html: string) => Promise<void>;
+
 export class TelegramControlBot {
   private readonly logger = rootLogger.child('control-bot');
 
-  private bot: TelegramBot | null = null;
+  private bot: Bot | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -34,10 +37,12 @@ export class TelegramControlBot {
       return;
     }
 
-    this.bot = new TelegramBot(this.config.telegramBotToken, { polling: true });
-    this.bot.on('message', async (message) => {
-      const incomingChatId = String(message.chat.id);
-      if (incomingChatId !== String(this.config.telegramChatId)) {
+    const bot = new Bot(this.config.telegramBotToken);
+    this.bot = bot;
+
+    bot.on('message', async (ctx) => {
+      const message = ctx.message;
+      if (!message || String(message.chat.id) !== String(this.config.telegramChatId)) {
         return;
       }
 
@@ -46,54 +51,77 @@ export class TelegramControlBot {
         return;
       }
 
+      const threadId = message.is_topic_message ? message.message_thread_id : undefined;
+      const reply: Reply = async (html) => {
+        await ctx.reply(html, {
+          parse_mode: 'HTML',
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        });
+      };
+
       const [command, ...args] = text.split(/\s+/);
-      switch (command.toLowerCase().split('@')[0]) {
-        case '/add':
-          await this.handleAdd(message.chat.id, args);
-          break;
-        case '/remove':
-          await this.handleRemove(message.chat.id, args);
-          break;
-        case '/list':
-          await this.handleList(message.chat.id);
-          break;
-        case '/config':
-          await this.handleConfig(message.chat.id, args);
-          break;
-        case '/status':
-          await this.handleStatus(message.chat.id);
-          break;
-        case '/delete':
-          await this.handleDelete(message.chat.id, args);
-          break;
-        case '/help':
-        case '/start':
-          await this.handleHelp(message.chat.id);
-          break;
-        default:
-          await this.bot?.sendMessage(message.chat.id, 'Unknown command. Use /help.', { parse_mode: 'HTML' });
-          break;
+      try {
+        switch (command.toLowerCase().split('@')[0]) {
+          case '/add':
+            await this.handleAdd(reply, args);
+            break;
+          case '/remove':
+            await this.handleRemove(reply, args);
+            break;
+          case '/list':
+            await this.handleList(reply);
+            break;
+          case '/config':
+            await this.handleConfig(reply, args);
+            break;
+          case '/status':
+            await this.handleStatus(reply);
+            break;
+          case '/delete':
+            await this.handleDelete(reply, args);
+            break;
+          case '/help':
+          case '/start':
+            await this.handleHelp(reply);
+            break;
+          default:
+            await reply('❓ Unknown command. Use /help.');
+            break;
+        }
+      } catch (error) {
+        // A bad argument (e.g. an invalid username) must never take the daemon down.
+        this.logger.warn('Command failed', { command, message: (error as Error).message });
+        await reply(`⚠️ ${escapeHtml((error as Error).message)}`).catch(() => undefined);
       }
     });
 
-    this.bot.on('polling_error', (error) => {
-      this.logger.warn('Polling error', { message: error.message });
+    bot.catch((error) => {
+      this.logger.error('Control bot handler error', { message: (error as Error)?.message ?? String(error) });
     });
+
+    // Resolves only when polling stops, so it is deliberately not awaited.
+    bot
+      .startPolling(undefined, {
+        onError: (error) => {
+          this.logger.warn('Polling error', { message: (error as Error)?.message ?? String(error) });
+        },
+      })
+      .catch((error) => {
+        this.logger.error('Control bot polling stopped', { message: (error as Error)?.message ?? String(error) });
+      });
   }
 
   async stop(): Promise<void> {
     if (this.bot) {
-      await this.bot.stopPolling();
+      this.bot.stop();
       this.bot = null;
     }
   }
 
-  private async handleAdd(chatId: number, args: string[]): Promise<void> {
+  private async handleAdd(reply: Reply, args: string[]): Promise<void> {
     if (!args.length) {
-      await this.bot?.sendMessage(
-        chatId,
-        '<b>Usage:</b>\n<code>/add username</code>\n<code>/add username spaces</code>\n<code>/add username tweets</code>\n<code>/add username tweets replies</code>',
-        { parse_mode: 'HTML' }
+      await reply(
+        'ℹ️ <b>Usage:</b>\n<code>/add username</code> — Spaces + tweets\n<code>/add username spaces</code>\n<code>/add username tweets</code>\n<code>/add username tweets replies</code>'
       );
       return;
     }
@@ -103,52 +131,46 @@ export class TelegramControlBot {
     const target = this.watchlistService.add(username, mode, watchReplies);
     const watching: string[] = [];
     if (target.watchSpaces) {
-      watching.push('Spaces');
+      watching.push('🎙 Spaces');
     }
     if (target.watchTweets) {
-      watching.push('Tweets');
+      watching.push('🐦 Tweets');
     }
     if (target.watchReplies) {
-      watching.push('Replies');
+      watching.push('💬 Replies');
     }
 
-    await this.bot?.sendMessage(chatId, `<b>Added @${username}</b>\nWatching: ${watching.join(' + ')}`, {
-      parse_mode: 'HTML',
-    });
+    await reply(`✅ <b>Added @${username}</b>\n👀 Watching: ${watching.join(' · ')}`);
   }
 
-  private async handleRemove(chatId: number, args: string[]): Promise<void> {
+  private async handleRemove(reply: Reply, args: string[]): Promise<void> {
     if (!args.length) {
-      await this.bot?.sendMessage(chatId, '<b>Usage:</b> <code>/remove username</code>', { parse_mode: 'HTML' });
+      await reply('ℹ️ <b>Usage:</b> <code>/remove username</code>');
       return;
     }
 
     const username = normalizeUsername(args[0]);
     const removed = this.watchlistService.remove(username);
-    await this.bot?.sendMessage(
-      chatId,
-      removed ? `<b>Removed @${username}</b>` : `@${username} was not in the watchlist.`,
-      { parse_mode: 'HTML' }
-    );
+    await reply(removed ? `🗑 <b>Removed @${username}</b>` : `ℹ️ @${username} was not in the watchlist.`);
   }
 
-  private async handleList(chatId: number): Promise<void> {
+  private async handleList(reply: Reply): Promise<void> {
     const users = this.watchlistService.list();
     if (!users.length) {
-      await this.bot?.sendMessage(chatId, '<b>Watchlist is empty.</b>', { parse_mode: 'HTML' });
+      await reply('📋 <b>Watchlist is empty.</b>\nAdd someone with <code>/add username</code>.');
       return;
     }
 
     const lines = users.map((target) => {
       const flags = [];
       if (target.watchSpaces) {
-        flags.push('Spaces');
+        flags.push('🎙 Spaces');
       }
       if (target.watchTweets) {
-        flags.push('Tweets');
+        flags.push('🐦 Tweets');
       }
       if (target.watchReplies) {
-        flags.push('Replies');
+        flags.push('💬 Replies');
       }
       const saveIcons = [
         target.saveMedia ? '🖼' : '',
@@ -156,39 +178,43 @@ export class TelegramControlBot {
         target.saveMetadata ? '📄' : '',
       ].filter(Boolean).join('');
       const userId = target.userId ? ` <code>[${target.userId}]</code>` : '';
-      return `- <b>@${target.username}</b>${userId}\n  ${flags.join(', ')}  ${saveIcons || '(saves disabled)'}`;
+      return `• <b>@${target.username}</b>${userId}\n   ${flags.join(' · ') || 'nothing watched'}\n   💾 Saving: ${saveIcons || 'nothing'}`;
     });
 
-    await this.bot?.sendMessage(chatId, `<b>Watchlist (${users.length} users)</b>\n\n${lines.join('\n\n')}`, {
-      parse_mode: 'HTML',
-    });
+    await reply(`📋 <b>Watchlist (${users.length} user${users.length === 1 ? '' : 's'})</b>\n\n${lines.join('\n\n')}\n\n<i>🖼 media · 📸 screenshots · 📄 metadata</i>`);
   }
 
-  private async handleStatus(chatId: number): Promise<void> {
+  private async handleStatus(reply: Reply): Promise<void> {
     const status = this.statusProvider();
+    const stateIcon: Record<string, string> = {
+      watching: '🟢',
+      recording: '🔴',
+      downloading: '⬇️',
+      idle: '⚪',
+      stopped: '🟡',
+      error: '⚠️',
+    };
+    const live = status.activeSpaces.length
+      ? status.activeSpaces.map((space) => `"${escapeHtml(space.title)}"`).join(', ')
+      : 'none';
     const message =
-      `<b>Watcher Status</b>\n\n` +
-      `State: ${status.state}\n` +
-      `Mode: ${status.mode}\n` +
-      `Uptime: ${status.uptime}\n` +
-      `Spaces: ${status.spaceUsers}\n` +
-      `Tweets: ${status.tweetUsers}\n` +
-      `Reply watchers: ${status.replyUsers}\n` +
-      `Polls: ${status.pollCount}\n` +
-      `Seen tweets: ${status.totalSeenTweets}\n` +
-      `Recordings: ${status.totalRecordings}\n` +
-      `Active spaces: ${status.activeSpaces.length ? status.activeSpaces.map((space) => `"${escapeHtml(space.title)}"`).join(', ') : 'none'}\n` +
-      `Last error: ${status.lastError ? escapeHtml(status.lastError) : 'none'}`;
+      `📊 <b>Watcher status</b>\n\n` +
+      `${stateIcon[status.state] ?? '⚪'} State: ${status.state}\n` +
+      `⏱ Uptime: ${status.uptime}\n` +
+      `👀 Watching: ${status.spaceUsers} Spaces · ${status.tweetUsers} tweet accounts (${status.replyUsers} with replies)\n` +
+      `🔄 Polls: ${status.pollCount}\n` +
+      `🐦 Tweets seen: ${status.totalSeenTweets}\n` +
+      `🎙 Recordings: ${status.totalRecordings}\n` +
+      `🔴 Live now: ${live}\n` +
+      (status.lastError ? `⚠️ Last error: ${escapeHtml(status.lastError)}` : `✅ No errors`);
 
-    await this.bot?.sendMessage(chatId, message, { parse_mode: 'HTML' });
+    await reply(message);
   }
 
-  private async handleDelete(chatId: number, args: string[]): Promise<void> {
+  private async handleDelete(reply: Reply, args: string[]): Promise<void> {
     if (!args.length) {
-      await this.bot?.sendMessage(
-        chatId,
-        '<b>Usage:</b>\n<code>/delete username tweets</code>\n<code>/delete username spaces</code>\n<code>/delete username all</code>',
-        { parse_mode: 'HTML' }
+      await reply(
+        'ℹ️ <b>Usage:</b>\n<code>/delete username tweets</code>\n<code>/delete username spaces</code>\n<code>/delete username all</code>'
       );
       return;
     }
@@ -196,58 +222,49 @@ export class TelegramControlBot {
     const username = normalizeUsername(args[0]);
     const target = ((args[1] || 'all').toLowerCase() as DeleteTarget) || 'all';
     if (!['tweets', 'spaces', 'all'].includes(target)) {
-      await this.bot?.sendMessage(chatId, 'Invalid delete target. Use tweets, spaces, or all.', {
-        parse_mode: 'HTML',
-      });
+      await reply('⚠️ Invalid delete target. Use tweets, spaces, or all.');
       return;
     }
 
     const result = deleteUserDownloads(this.config.downloadRoot, username, target);
     const freedMb = (result.freedBytes / (1024 * 1024)).toFixed(1);
-    await this.bot?.sendMessage(
-      chatId,
+    await reply(
       result.deletedCount
-        ? `<b>Deleted ${target} data for @${username}</b>\nFiles removed: ${result.deletedCount}\nFreed: ${freedMb} MB`
-        : `No downloaded data found for @${username}.`,
-      { parse_mode: 'HTML' }
+        ? `🗑 <b>Deleted ${target} data for @${username}</b>\nFiles removed: ${result.deletedCount}\nFreed: ${freedMb} MB`
+        : `ℹ️ No downloaded data found for @${username}.`
     );
   }
 
-  private async handleHelp(chatId: number): Promise<void> {
-    await this.bot?.sendMessage(
-      chatId,
-      `<b>X Watcher v2 Commands</b>\n\n` +
-        `/add username\n` +
+  private async handleHelp(reply: Reply): Promise<void> {
+    await reply(
+      `❓ <b>X Watcher commands</b>\n\n` +
+        `<b>➕ Watch someone</b>\n` +
+        `/add username — Spaces + tweets\n` +
         `/add username spaces\n` +
         `/add username tweets\n` +
-        `/add username tweets replies\n` +
-        `/remove username\n` +
-        `/list\n` +
-        `/config username\n` +
-        `/config username media on|off\n` +
-        `/config username screenshots on|off\n` +
-        `/config username metadata on|off\n` +
-        `/config username all on|off\n` +
-        `/status\n` +
-        `/delete username tweets\n` +
-        `/delete username spaces\n` +
-        `/delete username all\n` +
-        `/help`,
-      { parse_mode: 'HTML' }
+        `/add username tweets replies\n\n` +
+        `<b>➖ Stop watching</b>\n` +
+        `/remove username\n\n` +
+        `<b>📋 Overview</b>\n` +
+        `/list — who is being watched\n` +
+        `/status — is everything working\n\n` +
+        `<b>⚙️ What gets saved</b>\n` +
+        `/config username — show settings\n` +
+        `/config username media|screenshots|metadata|all on|off\n\n` +
+        `<b>🗑 Delete downloaded files</b>\n` +
+        `/delete username tweets|spaces|all`
     );
   }
 
-  private async handleConfig(chatId: number, args: string[]): Promise<void> {
+  private async handleConfig(reply: Reply, args: string[]): Promise<void> {
     if (!args.length) {
-      await this.bot?.sendMessage(
-        chatId,
-        '<b>Usage:</b>\n' +
+      await reply(
+        'ℹ️ <b>Usage:</b>\n' +
           '<code>/config username</code> — view save settings\n' +
           '<code>/config username media on|off</code>\n' +
           '<code>/config username screenshots on|off</code>\n' +
           '<code>/config username metadata on|off</code>\n' +
-          '<code>/config username all on|off</code>',
-        { parse_mode: 'HTML' }
+          '<code>/config username all on|off</code>'
       );
       return;
     }
@@ -255,20 +272,18 @@ export class TelegramControlBot {
     const username = normalizeUsername(args[0]);
     const target = this.watchlistService.get(username);
     if (!target) {
-      await this.bot?.sendMessage(chatId, `@${username} is not in the watchlist.`, { parse_mode: 'HTML' });
+      await reply(`ℹ️ @${username} is not in the watchlist.`);
       return;
     }
 
     // View mode: just show current settings
     if (args.length < 3) {
       const icon = (v: boolean) => v ? '✅' : '❌';
-      await this.bot?.sendMessage(
-        chatId,
-        `<b>Save settings for @${username}</b>\n\n` +
+      await reply(
+        `⚙️ <b>Save settings for @${username}</b>\n\n` +
           `${icon(target.saveMedia)} Media (images/videos)\n` +
           `${icon(target.saveScreenshots)} Screenshots\n` +
-          `${icon(target.saveMetadata)} Metadata (JSON)`,
-        { parse_mode: 'HTML' }
+          `${icon(target.saveMetadata)} Metadata (JSON)`
       );
       return;
     }
@@ -279,7 +294,7 @@ export class TelegramControlBot {
 
     const validFields = ['media', 'screenshots', 'metadata', 'all'];
     if (!validFields.includes(field)) {
-      await this.bot?.sendMessage(chatId, `Invalid field. Use: ${validFields.join(', ')}`, { parse_mode: 'HTML' });
+      await reply(`⚠️ Invalid field. Use: ${validFields.join(', ')}`);
       return;
     }
 
@@ -292,13 +307,11 @@ export class TelegramControlBot {
 
     const updated = this.watchlistService.get(username)!;
     const icon = (v: boolean) => v ? '✅' : '❌';
-    await this.bot?.sendMessage(
-      chatId,
-      `<b>Updated @${username}</b>\n\n` +
+    await reply(
+      `⚙️ <b>Updated @${username}</b>\n\n` +
         `${icon(updated.saveMedia)} Media\n` +
         `${icon(updated.saveScreenshots)} Screenshots\n` +
-        `${icon(updated.saveMetadata)} Metadata`,
-      { parse_mode: 'HTML' }
+        `${icon(updated.saveMetadata)} Metadata`
     );
   }
 }

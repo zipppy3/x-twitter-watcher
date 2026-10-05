@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import axios from 'axios';
-import { AppConfig, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, Tweet, TwitterClient, WatchTarget } from '../types';
+import { AppConfig, HealthReporter, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, Tweet, TwitterClient, WatchTarget } from '../types';
 import { rootLogger } from '../runtime/logger';
-import { escapeHtml } from '../utils/html';
 import { ensureFileDir, sanitizeFilename } from '../utils/files';
 import { sleep, randomSleep } from '../utils/async';
 import { getTopicId } from '../services/topic-routing';
+import { buildThreadMessage, buildTweetMessage, MEDIA_MISSING_NOTE } from '../services/telegram-messages';
 
 function getTimestamp(dateStr: string): string {
   return new Date(dateStr).toISOString().replace(/[^0-9]/g, '').substring(2, 14);
@@ -40,12 +41,18 @@ export class TweetMonitorWorker {
 
   private static readonly CONCURRENCY_LIMIT = 3;
 
+  /** After this many failed deliveries a tweet is given up on, so one bad tweet cannot block the rest forever. */
+  private static readonly MAX_DELIVERY_ATTEMPTS = 5;
+
+  private readonly deliveryAttempts = new Map<string, number>();
+
   constructor(
     private readonly config: AppConfig,
     private readonly storage: Storage,
     private readonly twitterClient: TwitterClient,
     private readonly telegramClient: TelegramClient,
-    private readonly screenshotService: ScreenshotService
+    private readonly screenshotService: ScreenshotService,
+    private readonly health?: HealthReporter
   ) {}
 
   async start(): Promise<void> {
@@ -82,6 +89,7 @@ export class TweetMonitorWorker {
     this.trackedUsernames = targets.map((target) => target.username);
 
     if (!targets.length) {
+      this.health?.beat();
       this.schedule(this.config.watchlistReloadIntervalMs);
       return;
     }
@@ -95,6 +103,8 @@ export class TweetMonitorWorker {
       workers.push(this.processQueue(queue));
     }
     const results = await Promise.allSettled(workers);
+    // The cycle finished (with or without errors): the loop itself is not stuck.
+    this.health?.beat();
     for (const result of results) {
       if (result.status === 'rejected') {
         hadError = true;
@@ -211,9 +221,11 @@ export class TweetMonitorWorker {
 
     const seenIds = new Set(this.storage.getSeenTweetIds(target.username));
     if (!seenIds.size) {
+      // Retweets are remembered too: a timeline made only of retweets would otherwise
+      // never count as initialised, and the user's next real tweet would be swallowed.
       this.storage.markTweetsSeen(
         target.username,
-        tweets.filter((tweet) => !tweet.isRetweet).map((tweet) => tweet.id)
+        tweets.map((tweet) => tweet.id)
       );
       this.logger.info('Initialized seen tweets for user', {
         username: target.username,
@@ -226,11 +238,6 @@ export class TweetMonitorWorker {
     if (!newTweets.length) {
       return;
     }
-
-    this.storage.markTweetsSeen(
-      target.username,
-      newTweets.map((tweet) => tweet.id)
-    );
 
     const threadConversations: Record<string, Tweet[]> = {};
     const standaloneTweets: Tweet[] = [];
@@ -247,34 +254,94 @@ export class TweetMonitorWorker {
       }
     }
 
+    const byId = (left: string, right: string): number => {
+      const diff = BigInt(left) - BigInt(right);
+      return diff < 0n ? -1 : diff > 0n ? 1 : 0;
+    };
+    const watched = target;
+
+    // One unit = one notification (a tweet, or a thread posted in one go).
+    const units: Array<{ ids: string[]; deliver: () => Promise<boolean> }> = [];
+
     for (const tweet of standaloneTweets) {
-      await this.enrichWithParentTweet(tweet);
-      await this.processNewTweet(tweet, target);
-      await randomSleep(3000, 6000);
+      units.push({
+        ids: [tweet.id],
+        deliver: async () => {
+          await this.enrichWithParentTweet(tweet);
+          return this.processNewTweet(tweet, watched);
+        },
+      });
     }
 
     for (const threadTweets of Object.values(threadConversations)) {
-      const sorted = [...threadTweets].sort((left, right) => {
-        const diff = BigInt(left.id) - BigInt(right.id);
-        return diff < 0n ? -1 : diff > 0n ? 1 : 0;
-      });
+      const sorted = [...threadTweets].sort((left, right) => byId(left.id, right.id));
 
       if (sorted.length >= 2) {
-        for (let i = 0; i < sorted.length; i++) {
-          if (i > 0 && sorted[i].inReplyToStatusId === sorted[i - 1].id) {
-            sorted[i].inReplyToTweet = sorted[i - 1];
-          } else {
-            await this.enrichWithParentTweet(sorted[i]);
-          }
-        }
-        await this.processThread(sorted, target);
-        await randomSleep(5000, 10000);
+        units.push({
+          ids: sorted.map((tweet) => tweet.id),
+          deliver: async () => {
+            for (let i = 0; i < sorted.length; i++) {
+              if (i > 0 && sorted[i].inReplyToStatusId === sorted[i - 1].id) {
+                sorted[i].inReplyToTweet = sorted[i - 1];
+              } else {
+                await this.enrichWithParentTweet(sorted[i]);
+              }
+            }
+            return this.processThread(sorted, watched);
+          },
+        });
       } else {
-        await this.enrichWithParentTweet(sorted[0]);
-        await this.processNewTweet(sorted[0], target);
-        await randomSleep(3000, 6000);
+        units.push({
+          ids: [sorted[0].id],
+          deliver: async () => {
+            await this.enrichWithParentTweet(sorted[0]);
+            return this.processNewTweet(sorted[0], watched);
+          },
+        });
       }
     }
+
+    // Oldest first, so the chat reads in the order things were posted.
+    units.sort((left, right) => byId(left.ids[0], right.ids[0]));
+
+    for (const unit of units) {
+      const finished = await this.deliverUnit(unit.ids[0], unit.deliver);
+      if (!finished) {
+        // Not marked as seen, so the next poll picks it up again. Stop here to keep
+        // the order: everything newer waits behind it.
+        break;
+      }
+      // Marked only now. A crash or a Telegram outage in the middle of a batch
+      // delays the remaining tweets instead of silently dropping them.
+      this.storage.markTweetsSeen(watched.username, unit.ids);
+      await randomSleep(3000, 6000);
+    }
+  }
+
+  /** Returns true once a unit is finished: delivered, or given up on after repeated failures. */
+  private async deliverUnit(key: string, deliver: () => Promise<boolean>): Promise<boolean> {
+    let delivered = false;
+    try {
+      delivered = await deliver();
+    } catch (error) {
+      this.logger.error('Processing a tweet failed', { tweetId: key, message: (error as Error).message });
+    }
+
+    if (delivered) {
+      this.deliveryAttempts.delete(key);
+      return true;
+    }
+
+    const attempts = (this.deliveryAttempts.get(key) ?? 0) + 1;
+    if (attempts >= TweetMonitorWorker.MAX_DELIVERY_ATTEMPTS) {
+      this.deliveryAttempts.delete(key);
+      this.logger.error('Giving up on a tweet after repeated delivery failures', { tweetId: key, attempts });
+      return true;
+    }
+
+    this.deliveryAttempts.set(key, attempts);
+    this.logger.warn('Tweet not delivered, will retry on the next poll', { tweetId: key, attempt: attempts });
+    return false;
   }
 
   private async enrichWithParentTweet(tweet: Tweet): Promise<void> {
@@ -334,12 +401,9 @@ export class TweetMonitorWorker {
         },
       });
 
-      await new Promise<void>((resolve, reject) => {
-        const writer = fs.createWriteStream(outputPath);
-        response.data.pipe(writer);
-        writer.on('finish', () => resolve());
-        writer.on('error', reject);
-      });
+      // pipeline() rejects if either side fails; a bare pipe() would leave this
+      // promise (and with it the whole poll loop) hanging on a broken download.
+      await pipeline(response.data, fs.createWriteStream(outputPath));
 
       return outputPath;
     } catch (error) {
@@ -365,8 +429,14 @@ export class TweetMonitorWorker {
       if (item.type === 'video' || item.type === 'animated_gif') {
         extension = '.mp4';
       } else if (item.type === 'photo') {
-        const normalized = item.url.replace(/\?.*$/, '');
-        mediaUrl = `${normalized}?format=jpg&name=orig`;
+        // pbs.twimg.com serves the original only when `format` matches the real
+        // file type; asking for a .png as jpg returns 404.
+        const match = item.url.replace(/\?.*$/, '').match(/^(https:\/\/pbs\.twimg\.com\/.+)\.(jpe?g|png|webp)$/i);
+        if (match) {
+          const format = match[2].toLowerCase();
+          extension = `.${format === 'jpeg' ? 'jpg' : format}`;
+          mediaUrl = `${match[1]}?format=${format}&name=orig`;
+        }
       }
 
       const filePath = path.join(mediaDir, `${baseName}_media${index + 1}${extension}`);
@@ -398,7 +468,8 @@ export class TweetMonitorWorker {
     }
   }
 
-  private async processNewTweet(tweet: Tweet, target: WatchTarget): Promise<void> {
+  /** Returns whether the notification was delivered (false = try again later). */
+  private async processNewTweet(tweet: Tweet, target: WatchTarget): Promise<boolean> {
     // Save metadata JSON to disk (if enabled)
     let jsonPath: string | null = null;
     let baseDir: string;
@@ -424,7 +495,7 @@ export class TweetMonitorWorker {
       const screenshotPath = path.join(baseDir, 'screenshots', `${baseName}.jpg`);
 
       // Detect if this is a reply made BY the watched user
-      const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username === target.username);
+      const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username?.toLowerCase() === target.username);
       if (isReplyByWatchedUser) {
         this.logger.info('Tweet is a reply by the watched user, will capture full conversation', {
           username: target.username,
@@ -444,17 +515,9 @@ export class TweetMonitorWorker {
       }
     }
 
-    const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username === target.username);
+    const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username?.toLowerCase() === target.username);
 
-    const textPreview = escapeHtml(
-      `${tweet.text.substring(0, 300)}${tweet.text.length > 300 ? '...' : ''}`
-    );
-    const message =
-      `<b>New Tweet</b>\n\n` +
-      `From: @${escapeHtml(tweet.author.username || target.username)}\n` +
-      `<blockquote>${textPreview}</blockquote>\n` +
-      `Likes: ${tweet.metrics.likes}  Retweets: ${tweet.metrics.retweets}\n` +
-      `Link: https://x.com/${target.username}/status/${tweet.id}`;
+    const message = buildTweetMessage(tweet, target.username);
 
     const topicId = getTopicId(this.config, target, 'tweet');
     // When isReplyByWatchedUser is true, the main screenshot already includes the
@@ -474,7 +537,6 @@ export class TweetMonitorWorker {
     }
 
     const allFiles: string[] = [];
-    if (jsonPath) allFiles.push(jsonPath);
     const mediaItems: TelegramMediaItem[] = [];
 
     if (parentScreenshotResult) {
@@ -492,30 +554,28 @@ export class TweetMonitorWorker {
       allFiles.push(item.path);
     }
 
-    let uploadSuccess = false;
-    if (mediaItems.length >= 2) {
-      uploadSuccess = await this.telegramClient.sendMediaGroup(mediaItems, message, topicId);
-    } else if (mediaItems.length === 1) {
-      uploadSuccess =
-        mediaItems[0].type === 'video'
-          ? await this.telegramClient.sendVideo(mediaItems[0].path, message, topicId)
-          : await this.telegramClient.sendPhoto(mediaItems[0].path, message, topicId);
-    } else {
-      uploadSuccess = await this.telegramClient.sendMessage(message, topicId);
+    const { delivered, mediaSent } = await this.sendNotification(mediaItems, message, topicId);
+    if (!delivered) {
+      return false;
     }
 
+    // Only files that really reached Telegram may be auto-deleted.
+    const uploaded = mediaSent ? [...allFiles] : [];
     const metadataThreadId = getTopicId(this.config, target, 'tweetMetadata');
     if (metadataThreadId && jsonPath && target.saveMetadata) {
-      const metaUploaded = await this.telegramClient.sendDocument(jsonPath, metadataThreadId);
-      if (!metaUploaded) {
-        uploadSuccess = false;
+      // Without a metadata topic the JSON is never uploaded, so it stays on disk.
+      if (await this.telegramClient.sendDocument(jsonPath, metadataThreadId)) {
+        uploaded.push(jsonPath);
       }
     }
 
-    this.autoDeleteFiles(allFiles, uploadSuccess);
+    this.autoDeleteFiles(uploaded, true);
+    this.health?.count('tweets');
+    return true;
   }
 
-  private async processThread(tweets: Tweet[], target: WatchTarget): Promise<void> {
+  /** Returns whether the notification was delivered (false = try again later). */
+  private async processThread(tweets: Tweet[], target: WatchTarget): Promise<boolean> {
     let jsonPath: string | null = null;
     let baseDir: string;
     let baseName: string;
@@ -532,11 +592,11 @@ export class TweetMonitorWorker {
 
     const mediaItems: TelegramMediaItem[] = [];
     const allFiles: string[] = [];
-    if (jsonPath) allFiles.push(jsonPath);
 
     if (target.saveMedia) {
-      for (const tweet of tweets) {
-        const downloaded = await this.downloadTweetMedia(tweet, baseDir, baseName);
+      for (const [index, tweet] of tweets.entries()) {
+        // Per-tweet prefix: with a shared name the second tweet's media overwrote the first's.
+        const downloaded = await this.downloadTweetMedia(tweet, baseDir, `${baseName}_t${index + 1}`);
         for (const item of downloaded) {
           mediaItems.push(item);
           allFiles.push(item.path);
@@ -584,37 +644,64 @@ export class TweetMonitorWorker {
       allFiles.push(screenshotResult);
     }
 
-    const preview = escapeHtml(
-      `${tweets[0].text.substring(0, 200)}${tweets[0].text.length > 200 ? '...' : ''}`
-    );
-    const message =
-      `<b>New Thread</b>\n\n` +
-      `From: @${escapeHtml(target.username)}\n` +
-      `Tweets: ${tweets.length}\n` +
-      `<blockquote>${preview}</blockquote>\n` +
-      `Link: https://x.com/${target.username}/status/${tweets[tweets.length - 1].id}`;
+    const message = buildThreadMessage(tweets, target.username);
 
     const topicId = getTopicId(this.config, target, 'tweet');
-    let uploadSuccess = false;
-    if (mediaItems.length >= 2) {
-      uploadSuccess = await this.telegramClient.sendMediaGroup(mediaItems, message, topicId);
-    } else if (mediaItems.length === 1) {
-      uploadSuccess =
-        mediaItems[0].type === 'video'
-          ? await this.telegramClient.sendVideo(mediaItems[0].path, message, topicId)
-          : await this.telegramClient.sendPhoto(mediaItems[0].path, message, topicId);
-    } else {
-      uploadSuccess = await this.telegramClient.sendMessage(message, topicId);
+    const { delivered, mediaSent } = await this.sendNotification(mediaItems, message, topicId);
+    if (!delivered) {
+      return false;
     }
 
+    // Only files that really reached Telegram may be auto-deleted.
+    const uploaded = mediaSent ? [...allFiles] : [];
     const metadataThreadId = getTopicId(this.config, target, 'tweetMetadata');
     if (metadataThreadId && jsonPath && target.saveMetadata) {
-      const metaUploaded = await this.telegramClient.sendDocument(jsonPath, metadataThreadId);
-      if (!metaUploaded) {
-        uploadSuccess = false;
+      // Without a metadata topic the JSON is never uploaded, so it stays on disk.
+      if (await this.telegramClient.sendDocument(jsonPath, metadataThreadId)) {
+        uploaded.push(jsonPath);
       }
     }
 
-    this.autoDeleteFiles(allFiles, uploadSuccess);
+    this.autoDeleteFiles(uploaded, true);
+    this.health?.count('tweets');
+    return true;
+  }
+
+  /**
+   * Send the notification. If the media cannot be uploaded, fall back to text
+   * only, so a broken screenshot or an oversized video never costs the whole post.
+   */
+  private async sendNotification(
+    mediaItems: TelegramMediaItem[],
+    message: string,
+    topicId: string | null
+  ): Promise<{ delivered: boolean; mediaSent: boolean }> {
+    if (!this.telegramClient.isConfigured()) {
+      // Nothing to deliver to: the files saved on disk are the result.
+      return { delivered: true, mediaSent: false };
+    }
+
+    if (!mediaItems.length) {
+      return { delivered: await this.telegramClient.sendMessage(message, topicId), mediaSent: false };
+    }
+
+    let mediaSent: boolean;
+    if (mediaItems.length >= 2) {
+      mediaSent = await this.telegramClient.sendMediaGroup(mediaItems, message, topicId);
+    } else {
+      mediaSent =
+        mediaItems[0].type === 'video'
+          ? await this.telegramClient.sendVideo(mediaItems[0].path, message, topicId)
+          : await this.telegramClient.sendPhoto(mediaItems[0].path, message, topicId);
+    }
+    if (mediaSent) {
+      return { delivered: true, mediaSent: true };
+    }
+
+    this.logger.warn('Media upload failed, sending the notification as text only');
+    return {
+      delivered: await this.telegramClient.sendMessage(message + MEDIA_MISSING_NOTE, topicId),
+      mediaSent: false,
+    };
   }
 }

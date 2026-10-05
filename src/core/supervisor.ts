@@ -6,6 +6,7 @@ import { WatchlistService } from '../services/watchlist-service';
 import { TweetMonitorWorker } from './tweet-monitor-worker';
 import { SpaceMonitorWorker } from './space-monitor-worker';
 import { TelegramControlBot } from '../bot/telegram-bot';
+import { buildStartedMessage, buildStoppedMessage } from '../services/telegram-messages';
 
 export class WatcherSupervisor {
   private readonly logger = rootLogger.child('supervisor');
@@ -62,9 +63,8 @@ export class WatcherSupervisor {
     }
 
     if (this.notificationClient.isConfigured()) {
-      await this.notificationClient.sendMessage(
-        `<b>X Watcher v2 started</b>\n\nMode: ${mode}\nSpaces: ${spacesCount}\nTweets: ${tweetsCount}`
-      );
+      const repliesCount = targets.filter((target) => target.watchTweets && target.watchReplies).length;
+      await this.notificationClient.sendMessage(buildStartedMessage(mode, spacesCount, tweetsCount, repliesCount));
     }
   }
 
@@ -77,10 +77,7 @@ export class WatcherSupervisor {
     this.logger.info('Stopping supervisor', { reason });
 
     if (this.notificationClient.isConfigured()) {
-      const emoji = exitStatus === 'error' ? '🔴' : '🟡';
-      await this.notificationClient.sendMessage(
-        `${emoji} <b>X Watcher v2 ${exitStatus === 'error' ? 'crashed' : 'stopped'}</b>\n\nReason: ${reason}`
-      ).catch(() => {
+      await this.notificationClient.sendMessage(buildStoppedMessage(exitStatus === 'error', reason)).catch(() => {
         // Best-effort: don't let notification failure block shutdown.
       });
     }

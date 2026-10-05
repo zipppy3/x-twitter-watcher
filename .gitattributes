@@ -1,0 +1,4 @@
+# Scripts that run on Linux must keep LF line endings even when checked out on Windows.
+*.sh text eol=lf
+*.service text eol=lf
+*.py text eol=lf

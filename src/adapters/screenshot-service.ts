@@ -1,26 +1,24 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Camoufox } from 'camoufox-js';
-import { AppConfig, ScreenshotService } from '../types';
+import { AppConfig, HealthReporter, ScreenshotService } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { ensureFileDir } from '../utils/files';
 import { withTimeout, Semaphore } from '../utils/async';
 import { ProxyRotator } from '../utils/proxy-rotator';
 import { NitterApiClient } from './nitter-client';
+import { CamoufoxBrowser } from './camoufox-browser';
 
 export class CamoufoxScreenshotService implements ScreenshotService {
   private readonly logger = rootLogger.child('screenshot');
 
-  private browser: any | null = null;
-
   private semaphore = new Semaphore(4);
-
-  private available = true;
 
   constructor(
     private readonly config: AppConfig,
+    private readonly camoufox: CamoufoxBrowser,
     private readonly proxyRotator?: ProxyRotator,
     private readonly nitterClient?: NitterApiClient,
+    private readonly health?: HealthReporter,
   ) {}
 
   async captureTweet(username: string, tweetId: string, outputPath: string, isReply = false): Promise<string | null> {
@@ -62,10 +60,7 @@ export class CamoufoxScreenshotService implements ScreenshotService {
   }
 
   async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close().catch(() => undefined);
-      this.browser = null;
-    }
+    // The shared Camoufox browser is owned and closed by the daemon.
   }
 
   private enqueue(task: () => Promise<string | null>, label: string): Promise<string | null> {
@@ -74,8 +69,10 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       const result = await withTimeout(task(), this.config.screenshotTimeoutMs, null);
       if (result) {
         this.logger.info(`Screenshot captured successfully: ${label}`, { path: result });
+        this.health?.ok('screenshot');
       } else {
         this.logger.warn(`Screenshot capture returned null (timeout or error): ${label}`);
+        this.health?.fail('screenshot', `No screenshot for ${label}`);
       }
       return result;
     };
@@ -83,22 +80,8 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     return this.semaphore.run(run);
   }
 
-  private async ensureBrowser(): Promise<any | null> {
-    if (!this.available) {
-      return null;
-    }
-
-    if (!this.browser) {
-      try {
-        this.browser = await Camoufox({ headless: true });
-      } catch (error) {
-        this.available = false;
-        this.logger.error('Failed to start Camoufox', { message: (error as Error).message });
-        return null;
-      }
-    }
-
-    return this.browser;
+  private ensureBrowser(): Promise<any | null> {
+    return this.camoufox.get();
   }
 
   /**
@@ -128,6 +111,47 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     return false;
   }
 
+  /**
+   * Wait until every image inside the posts being captured has really loaded.
+   *
+   * Avatars and media are inserted after the post's text appears, so checking the
+   * images present at one moment is not enough: that is how screenshots ended up
+   * with grey "@na..." placeholders instead of profile pictures. An image that
+   * failed outright is requested once more before giving up.
+   */
+  private async waitForPostImages(page: any, url: string): Promise<void> {
+    const allLoaded = () => {
+      const posts = Array.from(document.querySelectorAll('article[data-watcher-capture]'));
+      const images = posts.flatMap((post) => Array.from(post.querySelectorAll('img')));
+      // Every post has at least an avatar; none yet means they are still being inserted.
+      return images.length >= posts.length && images.every((img) => img.complete && img.naturalWidth > 0);
+    };
+
+    const waitFor = (timeout: number): Promise<boolean> =>
+      page.waitForFunction(allLoaded, undefined, { timeout, polling: 200 }).then(() => true, () => false);
+
+    if (await waitFor(8000)) {
+      return;
+    }
+
+    const retried = await page.evaluate(() => {
+      let count = 0;
+      for (const img of Array.from(document.querySelectorAll('article[data-watcher-capture] img')) as HTMLImageElement[]) {
+        if (img.complete && img.naturalWidth === 0 && img.src) {
+          const src = img.src;
+          img.src = '';
+          img.src = src;
+          count += 1;
+        }
+      }
+      return count;
+    });
+
+    if (!(await waitFor(6000))) {
+      this.logger.warn('Some images in the post did not load before the screenshot', { url, retried });
+    }
+  }
+
   private async captureUrl(url: string, outputPath: string, fullPage: boolean, isReply: boolean, useProxy: boolean): Promise<string | null> {
     const browser = await this.ensureBrowser();
     if (!browser) {
@@ -151,26 +175,37 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       });
       page = await context.newPage();
 
-      const tweetSelector = isNitter ? '.main-tweet' : 'article[data-testid="tweet"]';
+      // Logged-out visitors get X's newer web app, whose posts are plain <article>
+      // elements; the logged-in app still uses article[data-testid="tweet"].
+      const tweetSelector = isNitter ? '.main-tweet' : 'article';
+
+      if (!isNitter && this.config.screenshotLoggedIn && this.config.twitterAuthToken && this.config.twitterCsrfToken) {
+        await context.addCookies([
+          { name: 'auth_token', value: this.config.twitterAuthToken, domain: '.x.com', path: '/', httpOnly: true, secure: true, sameSite: 'None' },
+          { name: 'ct0', value: this.config.twitterCsrfToken, domain: '.x.com', path: '/', secure: true, sameSite: 'Lax' },
+        ]);
+      }
 
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForSelector(tweetSelector, { timeout: 15000 });
 
-      // Wait for images to load (prevents gray circle profile pictures)
-      await Promise.race([
-        page.evaluate(() => {
-          return Promise.all(
-            Array.from(document.images)
-              .filter(img => !img.complete)
-              .map(img => new Promise(resolve => {
-                img.onload = img.onerror = resolve;
-              }))
-          );
-        }),
-        page.waitForTimeout(5000)
-      ]).catch(() => undefined);
+      if (isNitter) {
+        // Wait for images to load (prevents gray circle profile pictures)
+        await Promise.race([
+          page.evaluate(() => {
+            return Promise.all(
+              Array.from(document.images)
+                .filter(img => !img.complete)
+                .map(img => new Promise(resolve => {
+                  img.onload = img.onerror = resolve;
+                }))
+            );
+          }),
+          page.waitForTimeout(5000)
+        ]).catch(() => undefined);
 
-      await page.waitForTimeout(fullPage ? 1500 : 500);
+        await page.waitForTimeout(500);
+      }
 
       ensureFileDir(outputPath);
 
@@ -225,36 +260,21 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         return outputPath;
       }
 
-      // ── X/Twitter path: clip-based screenshots (unchanged) ──
-      if (!isNitter) {
-        try {
-          const showMore = page.locator('span:has-text("Show more"), [data-testid="tweetText"] div[role="button"]');
-          if (await showMore.first().isVisible({ timeout: 1000 })) {
-            await showMore.first().click();
-            await page.waitForTimeout(500);
-          }
-        } catch {
-          // Ignore missing "Show more".
+      // ── X/Twitter path: clip from the top of the conversation to the captured post ──
+      try {
+        const showMore = page.locator('span:has-text("Show more"), [data-testid="tweetText"] div[role="button"]');
+        if (await showMore.first().isVisible({ timeout: 1000 })) {
+          await showMore.first().click();
+          await page.waitForTimeout(500);
         }
-      }
-
-      if (!isNitter) {
-        try {
-          const closeButton = page.locator('[data-testid="xMigrationBottomBar"] button, [role="button"][aria-label="Close"]');
-          if (await closeButton.first().isVisible({ timeout: 1000 })) {
-            await closeButton.first().click();
-            await page.waitForTimeout(500);
-          }
-        } catch {
-          // Ignore missing overlays.
-        }
+      } catch {
+        // Ignore missing "Show more".
       }
 
       await page.evaluate(() => {
         const selectors = [
           '[data-testid="xMigrationBottomBar"]',
           '[data-testid="BottomBar"]',
-          'header[role="banner"]',
           '#credential_picker_container',
           'iframe[src*="smartlock.google.com"]',
           'iframe[src*="accounts.google.com"]',
@@ -263,21 +283,49 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         document
           .querySelectorAll(selectors)
           .forEach((element) => ((element as HTMLElement).style.display = 'none'));
+        // The page may have scrolled to the post; measure from the top so the
+        // posts it replies to are included and the sticky header is not in the way.
+        window.scrollTo(0, 0);
       });
+      await page.waitForTimeout(300);
 
-      if (fullPage) {
-        await page.screenshot({ path: outputPath, type: 'jpeg', quality: 85, fullPage: true });
-        if (proxyConfig && this.proxyRotator) {
-          this.proxyRotator.markSuccess(proxyConfig.server);
+      const tweetId = url.match(/\/status\/(\d+)/)?.[1] ?? '';
+
+      // Mark the posts that belong in the picture: the captured post and what it
+      // replies to. Posts below it are other people's replies and are left out.
+      const marked = await page.evaluate((focalId: string) => {
+        const articles = (Array.from(document.querySelectorAll('article')) as HTMLElement[]).filter(
+          (element) => element.offsetHeight > 0
+        );
+        if (!articles.length) {
+          return 0;
         }
-        return outputPath;
+
+        // The captured post is the one that links to its own status URL (or, when
+        // logged in, the one with tabindex -1).
+        const ownLink = new RegExp(`/status/${focalId}(?:[/?#]|$)`);
+        let focalIndex = articles.findIndex((article) => article.getAttribute('tabindex') === '-1');
+        if (focalIndex === -1 && focalId) {
+          focalIndex = articles.findIndex((article) =>
+            Array.from(article.querySelectorAll('a[href]')).some((link) => ownLink.test(link.getAttribute('href') || ''))
+          );
+        }
+        if (focalIndex === -1) {
+          focalIndex = 0;
+        }
+
+        const selected = articles.slice(0, focalIndex + 1);
+        selected.forEach((article) => article.setAttribute('data-watcher-capture', '1'));
+        return selected.length;
+      }, tweetId);
+
+      if (marked > 0) {
+        await this.waitForPostImages(page, url);
       }
 
       const clip = await page.evaluate(() => {
-        const tweets = Array.from(document.querySelectorAll('article[data-testid="tweet"]')).filter(
-          (element) => (element as HTMLElement).offsetHeight > 0
-        );
-        if (!tweets.length) {
+        const articles = Array.from(document.querySelectorAll('article[data-watcher-capture]')) as HTMLElement[];
+        if (!articles.length) {
           return null;
         }
 
@@ -286,30 +334,31 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         let bottom = Number.NEGATIVE_INFINITY;
         let right = Number.NEGATIVE_INFINITY;
 
-        for (const tweet of tweets) {
-          const cell = tweet.closest('[data-testid="cellInnerDiv"]') || tweet;
-          const rect = cell.getBoundingClientRect();
+        for (const article of articles) {
+          // The article itself, not its timeline cell: when logged in, the cell of the
+          // captured post also holds the reply box with the account's own avatar.
+          const rect = article.getBoundingClientRect();
           top = Math.min(top, rect.top);
           left = Math.min(left, rect.left);
           bottom = Math.max(bottom, rect.bottom);
           right = Math.max(right, rect.right);
         }
 
-        let finalHeight = bottom - top;
-        if (finalHeight > 8000) {
-          finalHeight = 8000;
-        }
-
+        const padding = 8;
+        const x = Math.max(0, left + window.scrollX - padding);
+        const y = Math.max(0, top + window.scrollY - padding);
         return {
-          x: left + window.scrollX,
-          y: top + window.scrollY > 0 ? top + window.scrollY : 0,
-          width: right - left,
-          height: finalHeight,
+          x,
+          y,
+          width: right - left + padding * 2,
+          height: Math.min(bottom - top + padding * 2, 8000),
         };
       });
 
       if (clip && clip.width > 0 && clip.height > 0) {
-        await page.screenshot({ path: outputPath, type: 'jpeg', quality: 85, clip });
+        // fullPage makes the clip relative to the document, so a long conversation
+        // is not cut off at the viewport edge.
+        await page.screenshot({ path: outputPath, type: 'jpeg', quality: 85, clip, fullPage: true });
       } else {
         await page.locator(tweetSelector).first().screenshot({ path: outputPath, type: 'jpeg', quality: 85 });
       }

@@ -5,13 +5,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadAppConfig } from './config/app-config';
 import { SqliteStorage } from './storage/sqlite-storage';
-import { isProcessRunning, readPidFile } from './runtime/pid-file';
+import {
+  clearStoppedOnPurpose,
+  isDaemonRunning,
+  markStoppedOnPurpose,
+  readPidFile,
+  stopDaemon,
+  wasStoppedOnPurpose,
+} from './runtime/pid-file';
 import { migrateFromV1 } from './storage/migrate-v1';
 import { rootLogger } from './runtime/logger';
 import { modeToFlags, normalizeUsername } from './services/watchlist-service';
 import { formatUptime } from './utils/time';
 import { runDaemon } from './daemon';
 import { TelegramBotApiClient } from './adapters/telegram-client';
+import { TwitterApiClient } from './adapters/twitter-client';
+import { NitterApiClient } from './adapters/nitter-client';
+import { CamoufoxBrowser, resolvePythonExecutable } from './adapters/camoufox-browser';
+import { markTimelinesSeen } from './services/catchup';
+import { createProxyRotator } from './utils/proxy-rotator';
 import { deleteUserDownloads, DeleteTarget } from './services/download-manager';
 import { ask, banner, c } from './utils/prompt';
 import { readEnv, updateEnvKey } from './utils/env';
@@ -25,14 +37,20 @@ function createStorage(env?: string, db?: string, downloadRoot?: string) {
   return { config, storage };
 }
 
-async function cmdStart(options: { env?: string; db?: string; downloadRoot?: string; foreground?: boolean }) {
+async function cmdStart(options: { env?: string; db?: string; downloadRoot?: string; foreground?: boolean; clean?: boolean }) {
   const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
   storage.close();
 
-  const pid = readPidFile(config.pidPath);
-  if (isProcessRunning(pid)) {
-    console.log(`Watcher v2 is already running (pid ${pid}).`);
+  if (isDaemonRunning(config.pidPath)) {
+    console.log(`Watcher v2 is already running (pid ${readPidFile(config.pidPath)}).`);
     return;
+  }
+
+  // An explicit start cancels an earlier explicit stop (see `ensure-running`).
+  clearStoppedOnPurpose(config.pidPath);
+
+  if (options.clean) {
+    await cmdCatchUp(options);
   }
 
   let isForeground = options.foreground;
@@ -56,6 +74,12 @@ async function cmdStart(options: { env?: string; db?: string; downloadRoot?: str
   }
 
   const daemonEntry = path.join(config.packageRoot, 'dist', 'daemon.js');
+  if (!fs.existsSync(daemonEntry)) {
+    console.log(c.red('\n  ✖ dist/daemon.js not found. Background mode runs the compiled code: run "npm run build" first.\n'));
+    process.exitCode = 1;
+    return;
+  }
+
   const child = spawn(process.execPath, [daemonEntry, '--mode', 'daemon', ...(options.env ? ['--env', options.env] : []), ...(options.db ? ['--db', options.db] : []), ...(options.downloadRoot ? ['--download-root', options.downloadRoot] : [])], {
     cwd: config.packageRoot,
     detached: true,
@@ -63,29 +87,75 @@ async function cmdStart(options: { env?: string; db?: string; downloadRoot?: str
     windowsHide: true,
   });
   child.unref();
+
+  // Background output is not visible, so make sure the daemon actually came up
+  // before reporting success.
+  let alive = false;
+  let exited = false;
+  child.once('exit', () => {
+    exited = true;
+  });
+  for (let waited = 0; waited < 15000 && !exited; waited += 500) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (waited >= 3000 && isDaemonRunning(config.pidPath) && readPidFile(config.pidPath) === child.pid) {
+      alive = true;
+      break;
+    }
+  }
+
+  if (!alive) {
+    console.log(c.red('\n  ✖ The watcher exited during startup.'));
+    console.log(`  Check ${config.logPath}, or run it in the foreground to see the error: ${c.bold('npm run dev:fg')}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
   console.log(c.green(`\n  ✅ Watcher v2 started in the background (pid ${child.pid}).\n`));
 }
 
-function cmdStop(options: { env?: string; db?: string; downloadRoot?: string }) {
+async function cmdStop(options: { env?: string; db?: string; downloadRoot?: string }) {
   const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
   storage.close();
 
   const pid = readPidFile(config.pidPath);
-  if (!isProcessRunning(pid)) {
+  if (isDaemonRunning(config.pidPath)) {
+    console.log(`Stopping watcher v2 (pid ${pid})...`);
+  }
+
+  const result = await stopDaemon(config.pidPath);
+  // Tell the auto-restart watchdog this was intentional.
+  markStoppedOnPurpose(config.pidPath);
+  if (result === 'not-running') {
     console.log('Watcher v2 is not running.');
+  } else if (result === 'stopped') {
+    console.log(c.green('  ✅ Watcher v2 stopped.'));
+  } else {
+    console.log(c.yellow('  ⚠ Watcher v2 did not shut down in time and was killed.'));
+  }
+}
+
+/**
+ * Watchdog entry point for a scheduler (Windows Task Scheduler, cron): start the
+ * watcher if it is not running, unless it was stopped with `stop`.
+ */
+async function cmdEnsureRunning(options: { env?: string; db?: string; downloadRoot?: string }) {
+  const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
+  storage.close();
+
+  if (wasStoppedOnPurpose(config.pidPath) || isDaemonRunning(config.pidPath)) {
     return;
   }
 
-  process.kill(pid!, 'SIGTERM');
-  console.log(`Sent SIGTERM to watcher v2 (pid ${pid}).`);
+  rootLogger.child('watchdog').warn('Watcher is not running; starting it');
+  await cmdStart({ ...options, foreground: false });
 }
 
 function cmdStatus(options: { env?: string; db?: string; downloadRoot?: string }) {
   const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
   const runtime = storage.getRuntimeState();
   const targets = storage.getWatchTargets();
-  const pid = readPidFile(config.pidPath);
-  const running = isProcessRunning(pid);
+  const running = isDaemonRunning(config.pidPath);
+  const pid = running ? readPidFile(config.pidPath) : null;
   const replyUsers = targets.filter((target) => target.watchReplies).length;
 
   banner();
@@ -93,9 +163,10 @@ function cmdStatus(options: { env?: string; db?: string; downloadRoot?: string }
 
   console.log(`  ${c.cyan('Status:')}    ${running ? c.green('Running') : c.red('Stopped')}`);
   console.log(`  ${c.cyan('PID:')}       ${pid ?? 'n/a'}`);
-  console.log(`  ${c.cyan('State:')}     ${runtime.status}`);
+  // The stored state is whatever the daemon last wrote; it only means something while it runs.
+  console.log(`  ${c.cyan('State:')}     ${running ? runtime.status : 'stopped'}`);
   console.log(`  ${c.cyan('Mode:')}      ${runtime.mode}`);
-  console.log(`  ${c.cyan('Uptime:')}    ${formatUptime(runtime.startedAt)}`);
+  console.log(`  ${c.cyan('Uptime:')}    ${running ? formatUptime(runtime.startedAt) : 'n/a'}`);
   console.log('');
   console.log(`  ${c.cyan('Watchlist:')} ${targets.filter((t) => t.watchSpaces).length} Spaces, ${targets.filter((t) => t.watchTweets).length} Tweets (${replyUsers} Replies)`);
   console.log(`  ${c.cyan('Activity:')}  ${runtime.pollCount} Polls, ${storage.getSeenTweetCount()} Tweets, ${storage.getRecordingCount()} Recordings`);
@@ -111,7 +182,7 @@ function cmdStatus(options: { env?: string; db?: string; downloadRoot?: string }
   storage.close();
 }
 
-function cmdAdd(username: string, options: { env?: string; db?: string; downloadRoot?: string; spaces?: boolean; tweets?: boolean; replies?: boolean; noMedia?: boolean; noScreenshots?: boolean; noMetadata?: boolean }) {
+function cmdAdd(username: string, options: { env?: string; db?: string; downloadRoot?: string; spaces?: boolean; tweets?: boolean; replies?: boolean; media?: boolean; screenshots?: boolean; metadata?: boolean }) {
   const { storage } = createStorage(options.env, options.db, options.downloadRoot);
   const normalized = normalizeUsername(username);
   const mode = options.spaces && !options.tweets ? 'spaces' : options.tweets && !options.spaces ? 'tweets' : 'all';
@@ -120,9 +191,10 @@ function cmdAdd(username: string, options: { env?: string; db?: string; download
     username: normalized,
     ...flags,
     watchReplies: Boolean(options.replies),
-    saveMedia: options.noMedia ? false : undefined,
-    saveScreenshots: options.noScreenshots ? false : undefined,
-    saveMetadata: options.noMetadata ? false : undefined,
+    // commander turns --no-media into `media: false`; anything else keeps the stored setting.
+    saveMedia: options.media === false ? false : undefined,
+    saveScreenshots: options.screenshots === false ? false : undefined,
+    saveMetadata: options.metadata === false ? false : undefined,
   });
   storage.close();
 
@@ -482,8 +554,7 @@ async function cmdSwitch(options: { env?: string; db?: string; downloadRoot?: st
   const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
   storage.close();
 
-  const pid = readPidFile(config.pidPath);
-  if (!isProcessRunning(pid)) {
+  if (!isDaemonRunning(config.pidPath)) {
     console.log(c.yellow('  ⚠ Watcher v2 is not running.\n'));
     return;
   }
@@ -495,40 +566,72 @@ async function cmdSwitch(options: { env?: string; db?: string; downloadRoot?: st
      return;
   }
 
-  process.kill(pid!, 'SIGTERM');
+  await stopDaemon(config.pidPath);
   console.log(c.green('\n  Stopped background service. Starting interactive watcher in foreground...\n'));
-  
-  // Wait a moment for graceful shutdown
-  await new Promise(r => setTimeout(r, 1000));
+
   await runDaemon({ env: options.env, db: options.db, downloadRoot: options.downloadRoot, mode: 'foreground' });
 }
 
-function cmdUpdate() {
+function cmdUpdate(options: { env?: string }) {
+  const { config, storage } = createStorage(options.env);
+  storage.close();
+  const cwd = config.packageRoot;
+  const python = resolvePythonExecutable(cwd);
+
   banner();
   console.log('  ' + c.bold('Updating X Watcher v2...\n'));
 
   try {
-    console.log(c.cyan('  [1/3] Pulling latest changes...'));
+    console.log(c.cyan('  [1/4] Pulling latest changes...'));
     try {
-      execSync('git pull', { stdio: 'inherit', cwd: process.cwd() });
+      execSync('git pull', { stdio: 'inherit', cwd });
     } catch {
       console.log(c.yellow('  ⚠ Git pull failed (not a git repo or no remote). Skipping.'));
     }
 
-    console.log(c.cyan('\n  [2/3] Updating npm packages...'));
-    execSync('npm install', { stdio: 'inherit', cwd: process.cwd() });
-    
-    console.log(c.cyan('\n  [3/3] Playwright browser refresh...'));
+    console.log(c.cyan('\n  [2/4] Updating npm packages...'));
+    execSync('npm install', { stdio: 'inherit', cwd });
+
+    console.log(c.cyan('\n  [3/4] Updating Camoufox (Python package + browser)...'));
     try {
-      execSync('npx playwright install chromium', { stdio: 'inherit', cwd: process.cwd() });
+      execSync(`"${python}" -m pip install -r requirements.txt`, { stdio: 'inherit', cwd });
+      execSync(`"${python}" -m camoufox fetch`, { stdio: 'inherit', cwd });
     } catch {
-      console.log(c.yellow('  ⚠ Playwright update skipped.'));
+      console.log(c.yellow('  ⚠ Camoufox update failed. Screenshots need: pip install -r requirements.txt && python -m camoufox fetch'));
     }
 
+    console.log(c.cyan('\n  [4/4] Rebuilding...'));
+    execSync('npm run build', { stdio: 'inherit', cwd });
+
     console.log(c.green('\n  ✅ Update complete!\n'));
-    console.log(c.gray('  If PM2 is wrapping your daemon, or if running detached, restart manualy to apply changes.\n'));
+    console.log(c.gray('  Restart the watcher to apply the changes.\n'));
   } catch (err) {
     console.log(c.red(`\n  ✖ Update failed: ${(err as Error).message}\n`));
+  }
+}
+
+async function cmdCatchUp(options: { env?: string; db?: string; downloadRoot?: string }) {
+  const { config, storage } = createStorage(options.env, options.db, options.downloadRoot);
+  const proxyRotator = createProxyRotator(config.proxyEnabled, config.proxyList, config.proxyIsRotatingEndpoint);
+  const camoufox = config.dataSource === 'nitter' ? new CamoufoxBrowser(config.packageRoot) : null;
+  const client = camoufox
+    ? new NitterApiClient(config, camoufox, proxyRotator)
+    : new TwitterApiClient(config, { proxyRotator, refreshHandler: async () => false });
+
+  try {
+    const results = await markTimelinesSeen(config, storage, client);
+    console.log(`\n  ${c.bold('Marked current timelines as seen')}\n`);
+    for (const result of results) {
+      const note = result.fetched ? '' : c.yellow('  (nothing fetched — check tokens)');
+      console.log(`  ${c.cyan('@' + result.username)}  ${result.newlyMarked} newly marked of ${result.fetched} fetched${note}`);
+    }
+    if (!results.length) {
+      console.log('  No users with tweet watching enabled.');
+    }
+    console.log('');
+  } finally {
+    await camoufox?.close();
+    storage.close();
   }
 }
 
@@ -597,6 +700,7 @@ program
   .command('start')
   .description('Start the watcher daemon')
   .option('--foreground', 'Run in the foreground (alias for global -f)')
+  .option('--clean', 'Mark everything already on the timelines as seen before starting')
   .action(async (opts) => {
     const global = program.opts();
     await cmdStart({
@@ -604,13 +708,30 @@ program
       db: global.db,
       downloadRoot: global.downloadRoot,
       foreground: opts.foreground || global.foreground,
+      clean: opts.clean,
     });
   });
 
-program.command('stop').action(() => {
+program.command('stop').action(async () => {
   const global = program.opts();
-  cmdStop(global);
+  await cmdStop(global);
 });
+
+program
+  .command('ensure-running')
+  .description('Start the watcher if it is not running, unless it was stopped with "stop" (for schedulers)')
+  .action(async () => {
+    const global = program.opts();
+    await cmdEnsureRunning(global);
+  });
+
+program
+  .command('catchup')
+  .description('Mark everything currently on the watched timelines as seen (no backlog on next start)')
+  .action(async () => {
+    const global = program.opts();
+    await cmdCatchUp(global);
+  });
 
 program.command('status').action(() => {
   const global = program.opts();
@@ -670,7 +791,8 @@ program
 program
   .command('update')
   .action(() => {
-    cmdUpdate();
+    const global = program.opts();
+    cmdUpdate({ env: global.env });
   });
 
 program
@@ -744,4 +866,8 @@ program
     cmdCleanup(global);
   });
 
-program.parse();
+program.parseAsync().catch((error: Error) => {
+  // e.g. an invalid username: show the message, not a stack trace.
+  console.log(c.red(`\n  ✖ ${error.message}\n`));
+  process.exit(1);
+});

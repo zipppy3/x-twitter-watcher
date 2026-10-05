@@ -1,20 +1,24 @@
 import path from 'node:path';
 import axios, { AxiosError, AxiosInstance } from 'axios';
 import dotenv from 'dotenv';
-import { AppConfig, Tweet, TwitterClient } from '../types';
+import { AppConfig, HealthReporter, Tweet, TwitterClient } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { refreshTokensFromProfile } from '../utils/refresh-tokens';
 import { ProxyRotator, PlaywrightProxyConfig } from '../utils/proxy-rotator';
+import { unescapeHtml } from '../utils/html';
 
 const TWITTER_API_URL = 'https://api.twitter.com';
 const TWITTER_PUBLIC_AUTHORIZATION =
   'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// Fallbacks for when the ids cannot be scraped from the web client (see QueryResolver).
+// X rotates these; last verified against the live API on 2026-10-05.
 const GRAPHQL_ENDPOINTS = {
-  UserByScreenName: { queryId: 'oUZZZ8Oddwxs8Cd3iW3UEA', operationName: 'UserByScreenName' },
-  UserTweets: { queryId: 'rIIwMe1ObkGh_ByBtTCtRQ', operationName: 'UserTweets' },
-  TweetDetail: { queryId: 'TuC3CinYecrqAyqccUyFhw', operationName: 'TweetDetail' },
+  UserByScreenName: { queryId: 'AMIBMjtxEEATh4z8V9GtRg', operationName: 'UserByScreenName' },
+  UserTweets: { queryId: 'P4MigfQQcQgVgHNg1_H5lA', operationName: 'UserTweets' },
+  UserTweetsAndReplies: { queryId: 'D6LBfPh1ENcZP2wxliZ9Og', operationName: 'UserTweetsAndReplies' },
+  TweetDetail: { queryId: 'z-3ZLa-NQ8Sp09diHkJNBg', operationName: 'TweetDetail' },
 } as const;
 
 const GRAPHQL_PARAMS = {
@@ -127,6 +131,13 @@ function buildUrl(endpoint: { queryId: string; operationName: string }): string 
   return `${TWITTER_API_URL}/graphql/${endpoint.queryId}/${endpoint.operationName}`;
 }
 
+/** Variants are not ordered by quality, so pick the highest bitrate explicitly. */
+function bestMp4Variant(variants: any[] | undefined): { url: string } | undefined {
+  return (variants || [])
+    .filter((variant) => variant.content_type === 'video/mp4')
+    .sort((left, right) => (right.bitrate || 0) - (left.bitrate || 0))[0];
+}
+
 function parseSingleTweet(rawResult: any): Tweet | null {
   if (!rawResult) {
     return null;
@@ -148,8 +159,7 @@ function parseSingleTweet(rawResult: any): Tweet | null {
     url:
       item.type === 'photo'
         ? item.media_url_https
-        : item.video_info?.variants?.find((variant: any) => variant.content_type === 'video/mp4')?.url ||
-          item.media_url_https,
+        : bestMp4Variant(item.video_info?.variants)?.url || item.media_url_https,
     preview: item.media_url_https,
   }));
   const urls = (legacy.entities?.urls || []).map((item: any) => ({
@@ -159,7 +169,9 @@ function parseSingleTweet(rawResult: any): Tweet | null {
 
   return {
     id: result.rest_id || legacy.id_str,
-    text: legacy.full_text,
+    // Long posts keep their full text in note_tweet; legacy.full_text is cut at 280
+    // characters and HTML-escaped (&amp; etc.), which would otherwise be escaped twice.
+    text: result.note_tweet?.note_tweet_results?.result?.text ?? unescapeHtml(legacy.full_text || ''),
     createdAt: legacy.created_at,
     authorId: userNode?.rest_id || legacy.user_id_str,
     author: {
@@ -245,15 +257,22 @@ class QueryResolver {
 
   private cacheTime = 0;
 
-  constructor(private readonly http: Pick<AxiosInstance, 'get'>) {}
+  constructor(
+    private readonly http: Pick<AxiosInstance, 'get'>,
+    private readonly getCookie: () => string | null = () => null
+  ) {}
 
   getCachedQueryId(operationName: string): string | null {
-    return this.cachedEndpoints ? this.cachedEndpoints[operationName] : null;
+    return this.cachedEndpoints?.[operationName] ?? null;
   }
 
   async getQueryId(operationName: (typeof QUERY_RESOLVER_OPERATIONS)[number], forceRefresh = false): Promise<string | null> {
-    const endpoints = await this.resolveQueryIds(forceRefresh);
-    return endpoints[operationName] || null;
+    try {
+      const endpoints = await this.resolveQueryIds(forceRefresh);
+      return endpoints[operationName] || null;
+    } catch {
+      return this.getCachedQueryId(operationName);
+    }
   }
 
   private async resolveQueryIds(forceRefresh = false): Promise<Record<string, string>> {
@@ -261,7 +280,12 @@ class QueryResolver {
       return this.cachedEndpoints;
     }
 
-    const html = await this.http.get('https://x.com', { headers: { 'User-Agent': UA }, timeout: 15000 }).then((res) => res.data);
+    // Logged-out visitors get a different web app whose bundles contain no query ids,
+    // so the page has to be requested with the session cookies.
+    const cookie = this.getCookie();
+    const html = await this.http
+      .get('https://x.com/home', { headers: { 'User-Agent': UA, ...(cookie ? { cookie } : {}) }, timeout: 15000 })
+      .then((res) => res.data);
     const urls = Array.from(
       new Set((html.match(/https:\/\/abs\.twimg\.com\/responsive-web\/client-web[^"'\s]+\.js/g) || []) as string[])
     );
@@ -296,6 +320,11 @@ class QueryResolver {
       }
     }
 
+    if (!Object.keys(found).length) {
+      // Keep whatever we had (possibly nothing) so the next call tries again.
+      return this.cachedEndpoints ?? found;
+    }
+
     this.cachedEndpoints = found;
     this.cacheTime = Date.now();
     return found;
@@ -320,15 +349,19 @@ export class TwitterApiClient implements TwitterClient {
       refreshHandler?: (reason: string) => Promise<boolean>;
       onRefreshFailure?: (reason: string, error: Error) => Promise<void>;
       proxyRotator?: ProxyRotator;
+      health?: HealthReporter;
     } = {}
   ) {
     this.http = options.httpClient ?? axios.create();
-    this.resolver = new QueryResolver(this.http as Pick<AxiosInstance, 'get'>);
+    this.resolver = new QueryResolver(this.http as Pick<AxiosInstance, 'get'>, () =>
+      this.authToken && this.csrfToken ? `auth_token=${this.authToken}; ct0=${this.csrfToken}` : null
+    );
     this.authToken = config.twitterAuthToken;
     this.csrfToken = config.twitterCsrfToken;
     this.refreshHandler = options.refreshHandler ?? ((reason) => this.runRefreshScript(reason));
     this.onRefreshFailure = options.onRefreshFailure;
     this.proxyRotator = options.proxyRotator;
+    this.health = options.health;
   }
 
   private readonly refreshHandler: (reason: string) => Promise<boolean>;
@@ -336,6 +369,18 @@ export class TwitterApiClient implements TwitterClient {
   private readonly onRefreshFailure?: (reason: string, error: Error) => Promise<void>;
 
   private readonly proxyRotator?: ProxyRotator;
+
+  private readonly health?: HealthReporter;
+
+  private refreshInFlight: Promise<boolean> | null = null;
+
+  private lastRefreshAttemptAt = 0;
+
+  private lastFailureAlertAt = 0;
+
+  private static readonly REFRESH_COOLDOWN_MS = 15 * 60 * 1000;
+
+  private static readonly FAILURE_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
   private getAxiosProxyConfig(proxyConfig: PlaywrightProxyConfig | null): any {
     if (!proxyConfig) return false;
@@ -405,11 +450,8 @@ export class TwitterApiClient implements TwitterClient {
   }
 
   async getUserTweetsAndReplies(userId: string, count = 20): Promise<Tweet[]> {
-    const freshId = await this.resolver.getQueryId('UserTweetsAndReplies');
-    if (!freshId) {
-      this.logger.error('Failed to resolve UserTweetsAndReplies query id');
-      return [];
-    }
+    const freshId =
+      (await this.resolver.getQueryId('UserTweetsAndReplies')) || GRAPHQL_ENDPOINTS.UserTweetsAndReplies.queryId;
 
     const payload = {
       variables: {
@@ -541,8 +583,37 @@ export class TwitterApiClient implements TwitterClient {
     return null;
   }
 
+  /**
+   * Try to obtain fresh tokens. Concurrent callers share one attempt, and after
+   * an attempt the next one is held off for a while: a dead session produces a
+   * 401 on every request, and each attempt launches a browser.
+   */
   async refreshAuth(reason: string): Promise<boolean> {
-    return this.refreshHandler(reason);
+    if (this.refreshInFlight) {
+      return this.refreshInFlight;
+    }
+    if (Date.now() - this.lastRefreshAttemptAt < TwitterApiClient.REFRESH_COOLDOWN_MS) {
+      return false;
+    }
+
+    this.lastRefreshAttemptAt = Date.now();
+    this.refreshInFlight = this.refreshHandler(reason)
+      .catch(() => false)
+      .finally(() => {
+        this.refreshInFlight = null;
+      });
+    return this.refreshInFlight;
+  }
+
+  private async notifyRefreshFailure(reason: string, error: Error): Promise<void> {
+    if (!this.onRefreshFailure) {
+      return;
+    }
+    if (Date.now() - this.lastFailureAlertAt < TwitterApiClient.FAILURE_ALERT_INTERVAL_MS) {
+      return;
+    }
+    this.lastFailureAlertAt = Date.now();
+    await this.onRefreshFailure(reason, error);
   }
 
   private getAuthHeaders(): Record<string, string> {
@@ -571,6 +642,7 @@ export class TwitterApiClient implements TwitterClient {
       if (rawProxy && this.proxyRotator) {
         this.proxyRotator.markSuccess(rawProxy.server);
       }
+      this.health?.ok('x-api');
       return result;
     } catch (error) {
       if (rawProxy && this.proxyRotator) {
@@ -591,6 +663,9 @@ export class TwitterApiClient implements TwitterClient {
           return this.requestWithAuthRetry(request, true, useProxy);
         }
       }
+      // Callers turn this into an empty result, so this is the only place an
+      // outage (dead session, rate limit, changed API) becomes visible.
+      this.health?.fail('x-api', axiosError.message);
       throw error;
     }
   }
@@ -600,23 +675,20 @@ export class TwitterApiClient implements TwitterClient {
 
     const profileDir = path.join(this.config.packageRoot, '.browser-profile');
     try {
-      const result = await refreshTokensFromProfile(profileDir, this.config.envPath);
+      const result = await refreshTokensFromProfile(profileDir, this.config.envPath, { rejectUnchanged: true });
 
       if (result) {
-        dotenv.config({ path: this.config.envPath, override: true });
+        dotenv.config({ path: this.config.envPath, override: true, quiet: true } as any);
         this.authToken = result.authToken;
         this.csrfToken = result.csrfToken;
+        this.lastFailureAlertAt = 0;
         return true;
       }
 
-      if (this.onRefreshFailure) {
-        await this.onRefreshFailure(reason, new Error('No valid tokens found in browser profile. Manual login required.'));
-      }
+      await this.notifyRefreshFailure(reason, new Error('No fresh tokens in the saved browser profile. Manual login required.'));
       return false;
     } catch (error) {
-      if (this.onRefreshFailure) {
-        await this.onRefreshFailure(reason, error as Error);
-      }
+      await this.notifyRefreshFailure(reason, error as Error);
       return false;
     }
   }

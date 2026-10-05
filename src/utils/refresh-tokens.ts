@@ -1,9 +1,36 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { rootLogger } from '../runtime/logger';
-import { updateEnvKey } from './env';
+import { readEnv, updateEnvKey } from './env';
 
 const logger = rootLogger.child('refresh-tokens');
+
+/**
+ * Open the saved login profile in a Chromium-based browser.
+ *
+ * playwright-core ships no browser of its own, so an installed Chrome or Edge is
+ * used; a Playwright-managed Chromium (`npx playwright-core install chromium`)
+ * is the last resort.
+ */
+async function launchProfile(profileDir: string, options: Record<string, unknown>): Promise<any> {
+  const { chromium } = await import('playwright-core');
+  let lastError: Error | null = null;
+  for (const channel of ['chrome', 'msedge', undefined]) {
+    try {
+      return await chromium.launchPersistentContext(profileDir, {
+        ...options,
+        ...(channel ? { channel } : {}),
+        args: ['--disable-blink-features=AutomationControlled'],
+      });
+    } catch (error) {
+      lastError = error as Error;
+    }
+  }
+  throw new Error(
+    `No usable Chrome, Edge or Chromium found (${lastError?.message.split(/\r?\n/)[0] ?? 'unknown error'}). ` +
+      'Install Chrome/Edge or run: npx playwright-core install chromium'
+  );
+}
 
 interface RefreshResult {
   authToken: string;
@@ -11,42 +38,33 @@ interface RefreshResult {
 }
 
 /**
- * Refresh Twitter auth tokens by launching a headless Playwright browser
- * with a saved persistent profile, navigating to Twitter, and extracting
- * fresh cookies.
+ * Refresh Twitter auth tokens by launching a headless browser with the saved
+ * persistent profile, navigating to Twitter, and extracting fresh cookies.
  *
- * Requires a prior `--setup` run where the user logged in manually.
+ * Requires a prior `login` run where the user logged in manually.
+ * With `rejectUnchanged`, cookies identical to the ones already in .env count
+ * as a failure (used by the automatic refresh, where those are known to be bad).
  */
 export async function refreshTokensFromProfile(
   profileDir: string,
-  envPath: string
+  envPath: string,
+  options: { rejectUnchanged?: boolean } = {}
 ): Promise<RefreshResult | null> {
   if (!fs.existsSync(profileDir)) {
-    logger.error('No saved browser profile. Run setup first.', { profileDir });
-    return null;
-  }
-
-  // Dynamic import: playwright may not be installed in all environments
-  let chromium: any;
-  try {
-    chromium = (await import('playwright')).chromium;
-  } catch {
-    logger.error('Playwright is not installed. Cannot refresh tokens automatically.');
+    logger.error('No saved browser profile. Run the `login` command first.', { profileDir });
     return null;
   }
 
   let context: any;
   try {
-    context = await chromium.launchPersistentContext(profileDir, {
-      headless: true,
-      args: ['--disable-blink-features=AutomationControlled'],
-    });
+    context = await launchProfile(profileDir, { headless: true });
 
     const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
     try {
-      await page.goto('https://x.com/home', { waitUntil: 'networkidle', timeout: 30000 });
-      await page.waitForTimeout(3000);
+      // x.com keeps connections open, so waiting for "networkidle" would always time out.
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(5000);
     } catch (error) {
       logger.error('Failed to navigate to Twitter', { message: (error as Error).message });
       await context.close();
@@ -62,13 +80,24 @@ export async function refreshTokensFromProfile(
     const csrfToken = ct0Cookie?.value ?? null;
 
     if (authToken && csrfToken) {
+      const current = readEnv(envPath);
+      if (
+        options.rejectUnchanged &&
+        current.TWITTER_AUTH_TOKEN === authToken &&
+        current.TWITTER_CSRF_TOKEN === csrfToken
+      ) {
+        // The profile holds the very session that is being rejected; re-saving it fixes nothing.
+        logger.error('Browser profile only has the session that is already failing. Manual login required.');
+        return null;
+      }
+
       updateEnvKey(envPath, 'TWITTER_AUTH_TOKEN', authToken);
       updateEnvKey(envPath, 'TWITTER_CSRF_TOKEN', csrfToken);
       logger.info('Tokens refreshed successfully');
       return { authToken, csrfToken };
     }
 
-    logger.error('No valid tokens found in browser profile. Re-run setup.');
+    logger.error('No valid tokens found in browser profile. Run the `login` command again.');
     return null;
   } catch (error) {
     logger.error('Token refresh failed', { message: (error as Error).message });
@@ -86,14 +115,6 @@ export async function setupBrowserProfile(
   profileDir: string,
   envPath: string
 ): Promise<boolean> {
-  let chromium: any;
-  try {
-    chromium = (await import('playwright')).chromium;
-  } catch {
-    logger.error('Playwright is not installed. Run: npx playwright install chromium');
-    return false;
-  }
-
   console.log('\n' + '═'.repeat(50));
   console.log('  Twitter Session Setup');
   console.log('═'.repeat(50));
@@ -102,9 +123,8 @@ export async function setupBrowserProfile(
   console.log('Once you see your home timeline, close the browser.\n');
 
   try {
-    const context = await chromium.launchPersistentContext(profileDir, {
+    const context = await launchProfile(profileDir, {
       headless: false,
-      args: ['--disable-blink-features=AutomationControlled'],
       viewport: { width: 1280, height: 800 },
     });
 

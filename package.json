@@ -6,34 +6,45 @@
   "type": "commonjs",
   "main": "dist/cli.js",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
+    "dev:fg": "tsx src/cli.ts start --foreground",
     "migrate:v1": "tsx src/cli.ts migrate:v1",
     "start": "node dist/cli.js start",
+    "start:fg": "node dist/cli.js start --foreground",
     "stop": "node dist/cli.js stop",
     "status": "node dist/cli.js status",
-    "test": "vitest run"
+    "login": "tsx src/cli.ts login",
+    "catchup": "tsx src/cli.ts catchup",
+    "test": "vitest run",
+    "autostart:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-autostart.ps1 -Install",
+    "autostart:remove": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-autostart.ps1 -Remove",
+    "autostart:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-autostart.ps1 -Status"
   },
   "dependencies": {
-    "axios": "^1.14.0",
-    "better-sqlite3": "^11.10.0",
-    "camoufox-js": "^0.10.0",
+    "axios": "^1.20.0",
+    "better-sqlite3": "^13.0.3",
     "cheerio": "^1.2.0",
-    "commander": "^13.1.0",
-    "dotenv": "^17.4.0",
-    "form-data": "^4.0.5",
-    "node-telegram-bot-api": "^0.67.0",
-    "twspace-crawler": "1.18.1"
+    "commander": "^15.0.0",
+    "dotenv": "^18.0.5",
+    "form-data": "^4.0.6",
+    "node-telegram-bot-api": "^2.1.0",
+    "playwright-core": "~1.62.1",
+    "twspace-crawler": "1.18.4"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^22.19.0",
-    "@types/node-telegram-bot-api": "^0.64.9",
-    "tsx": "^4.19.4",
-    "typescript": "^5.9.2",
-    "vitest": "^2.1.8"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2",
+    "vitest": "^5.0.3"
+  },
+  "allowScripts": {
+    "better-sqlite3": false,
+    "esbuild": false
   }
 }

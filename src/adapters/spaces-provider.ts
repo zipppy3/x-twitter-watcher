@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { AppConfig, SpacesProvider, SpacesProviderEvents, SpaceRecordedEvent, WatchTarget } from '../types';
+import { AppConfig, HealthReporter, SpacesProvider, SpacesProviderEvents, SpaceRecordedEvent, WatchTarget } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { formatDuration } from '../utils/time';
 import { ensureFileDir, sanitizeFilename } from '../utils/files';
@@ -22,7 +22,7 @@ function writeSpeakersMetadata(watcher: SpaceWatcherInstance, downloadRoot: stri
     return null;
   }
 
-  const metadataDir = path.join(downloadRoot, username, 'spaces', 'metadata');
+  const metadataDir = path.join(downloadRoot, username.toLowerCase(), 'spaces', 'metadata');
   const filePath = path.join(metadataDir, `${sanitizeFilename(watcher.filename)} - speakers.txt`);
   ensureFileDir(filePath);
   const participants = watcher.audioSpace?.participants;
@@ -66,13 +66,10 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
 
   private pollCount = 0;
 
-  private consecutiveEmptyPolls = 0;
-
-  private static readonly AUTH_FAILURE_THRESHOLD = 3;
-
   constructor(
     private readonly config: AppConfig,
-    private readonly refreshAuth?: (reason: string) => Promise<boolean>
+    private readonly refreshAuth?: (reason: string) => Promise<boolean>,
+    private readonly health?: HealthReporter
   ) {
     super();
   }
@@ -98,7 +95,9 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
       return;
     }
 
-    const userId = target.userId ?? (await this.resolveUserId(target.username));
+    // Called on every watchlist sync, so it must stay cheap: keep an id we already
+    // know and leave unknown ones for pollOnce to resolve.
+    const userId = target.userId ?? this.watchedUsers.get(target.username) ?? null;
     this.watchedUsers.set(target.username, userId);
   }
 
@@ -169,29 +168,19 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
       return;
     }
 
-    const liveSpaces = await this.getLiveSpaces(resolvedIds);
-
-    // Track consecutive empty polls to detect potential auth issues
-    if (liveSpaces.length === 0 && resolvedIds.length > 0) {
-      this.consecutiveEmptyPolls += 1;
-      if (this.consecutiveEmptyPolls >= TwspaceSpacesProvider.AUTH_FAILURE_THRESHOLD) {
-        this.logger.warn('Multiple consecutive empty Space polls — auth may be expired', {
-          consecutiveEmpty: this.consecutiveEmptyPolls,
-        });
-        if (this.refreshAuth) {
-          const refreshed = await this.refreshAuth('spaces_consecutive_empty_polls');
-          if (refreshed) {
-            this.logger.info('Auth refresh triggered from Spaces provider');
-            this.consecutiveEmptyPolls = 0;
-          }
-        } else {
-          this.emit('error', new Error(
-            `Spaces: ${this.consecutiveEmptyPolls} consecutive empty polls. Auth tokens may be expired.`
-          ));
-        }
+    let liveSpaces: any[];
+    try {
+      liveSpaces = await this.getLiveSpaces(resolvedIds);
+      this.health?.ok('spaces');
+    } catch (error) {
+      this.health?.fail('spaces', (error as Error).message);
+      // Nobody being live is the normal case; only a rejected request points at dead tokens.
+      const status = (error as { response?: { status?: number } }).response?.status;
+      if ((status === 401 || status === 403) && this.refreshAuth) {
+        this.logger.warn('Spaces poll was rejected, requesting an auth refresh', { status });
+        await this.refreshAuth(`spaces_http_${status}`);
       }
-    } else if (liveSpaces.length > 0) {
-      this.consecutiveEmptyPolls = 0;
+      throw error;
     }
 
     for (const liveSpace of liveSpaces) {
@@ -216,10 +205,13 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
       return (data || []).filter((space: any) => space.state === SpaceState.LIVE);
     }
 
-    if (this.config.twitterAuthToken) {
+    // Read the token from the environment first: a token refresh updates it there,
+    // while the config object still holds the value from startup.
+    const authToken = process.env.TWITTER_AUTH_TOKEN || this.config.twitterAuthToken;
+    if (authToken) {
       const data = await TwitterApi.getSpacesByFleetsAvatarContent(userIds, {
         authorization: TWITTER_PUBLIC_AUTHORIZATION,
-        cookie: `auth_token=${this.config.twitterAuthToken}`,
+        cookie: `auth_token=${authToken}`,
       });
       return Object.values(data.users || {})
         .map((item: any) => item.spaces?.live_content?.audiospace)
@@ -271,7 +263,8 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
     }
 
     // Move the recorded audio file into the per-user directory structure
-    const audioDir = path.join(this.config.downloadRoot, username, 'spaces', 'audio');
+    // Lower-case like the tweet folders, so Linux does not end up with two folders per user.
+    const audioDir = path.join(this.config.downloadRoot, username.toLowerCase(), 'spaces', 'audio');
     const audioFileName = path.basename(originalFilePath);
     const finalFilePath = path.join(audioDir, audioFileName);
     try {

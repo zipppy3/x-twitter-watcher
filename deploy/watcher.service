@@ -1,0 +1,35 @@
+# systemd unit for running the watcher on a Linux server.
+#
+# Install (replace the three placeholders, or let deploy/install-systemd.sh do it):
+#   sudo cp deploy/watcher.service /etc/systemd/system/x-watcher.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now x-watcher
+#
+# Day to day:
+#   sudo systemctl status x-watcher        journalctl -u x-watcher -f
+#   sudo systemctl restart x-watcher       sudo systemctl stop x-watcher
+#
+# Use systemctl (not `npm run start/stop`) once this is installed, so the two do
+# not start a second copy.
+
+[Unit]
+Description=X/Twitter watcher
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__NODE__ dist/daemon.js --mode daemon
+# SIGTERM triggers the watcher's own graceful shutdown; give it time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+# Restart after a crash or a kill, but stay down after a clean stop.
+Restart=on-failure
+RestartSec=15
+Environment=NODE_ENV=production
+Environment=LOG_LEVEL=warn
+
+[Install]
+WantedBy=multi-user.target

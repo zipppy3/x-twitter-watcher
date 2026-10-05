@@ -28,12 +28,34 @@ export interface AppConfig {
   telegramMetadataThreadId: string | null;
   telegramTweetThreadId: string | null;
   telegramTweetMetadataThreadId: string | null;
+  /** Topic for watcher notices (started/stopped, Space live, health alerts). Empty = the group's General topic. */
+  telegramStatusThreadId: string | null;
   autoDeleteUploaded: boolean;
+  /** Take X screenshots with the account's session (shows whole threads) instead of logged out. */
+  screenshotLoggedIn: boolean;
+  /** How long a data source may keep failing before a Telegram alert is sent. */
+  healthAlertAfterMs: number;
+  /** Local hour (0-23) of the daily "still alive" report, or null when disabled. */
+  healthDailyReportHour: number | null;
   tweetPollIntervalsMs: [number, number];
   tweetBootstrapDelayMs: number;
   screenshotTimeoutMs: number;
   watchlistReloadIntervalMs: number;
   spacePollIntervalMs: number;
+}
+
+export type HealthSource = 'x-api' | 'nitter' | 'spaces' | 'screenshot' | 'telegram';
+
+/** Where the fetchers report what happened, so outages do not go unnoticed. */
+export interface HealthReporter {
+  /** A request to `source` succeeded. */
+  ok(source: HealthSource): void;
+  /** A request to `source` failed for good (after any retries). */
+  fail(source: HealthSource, message: string): void;
+  /** The tweet polling loop finished a cycle. */
+  beat(): void;
+  /** Something was delivered (shown in the daily report). */
+  count(what: 'tweets' | 'spaces'): void;
 }
 
 export interface WatchTarget {

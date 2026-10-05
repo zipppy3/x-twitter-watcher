@@ -7,11 +7,7 @@ export default defineConfig({
     coverage: {
       reporter: ['text'],
     },
-    poolOptions: {
-      threads: {
-        singleThread: true,
-      },
-    },
+    // The suites share SQLite files and temp dirs, so run them one file at a time.
     fileParallelism: false,
   },
 });

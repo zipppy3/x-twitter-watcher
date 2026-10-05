@@ -15,8 +15,10 @@ Commands can be run using the source code (via `npm run dev -- <command>`) or th
 
 | Command | Description | Arguments / Options |
 | :--- | :--- | :--- |
-| `start` | Starts the watcher daemon. | `--foreground` (Interactive mode) |
-| `stop` | Gracefully stops the running daemon. | - |
+| `start` | Starts the watcher daemon. | `--foreground` (Interactive mode), `--clean` (skip the backlog) |
+| `stop` | Gracefully stops the running daemon (waits for it to exit). | - |
+| `catchup` | Marks everything currently on the watched timelines as seen. | - |
+| `ensure-running` | Starts the watcher if it is not running, unless it was stopped with `stop`. Used by the auto-restart task. | - |
 | `status` | Shows uptime, watchlist stats, and activity. | - |
 | `add` | Adds a user to the watchlist. | `<username> [--spaces] [--tweets] [--replies] [--no-media] [--no-screenshots] [--no-metadata]` |
 | `remove` | Removes a user from the watchlist. | `<username>` |
@@ -27,7 +29,7 @@ Commands can be run using the source code (via `npm run dev -- <command>`) or th
 | `setup` | Interactive first-time setup wizard. | - |
 | `login` | Manual browser login to refresh tokens. | - |
 | `update-tokens`| Update Twitter tokens in `.env`. | - |
-| `update` | Pulls code, updates npm & Playwright. | - |
+| `update` | Pulls code, updates npm packages and Camoufox, rebuilds. | - |
 | `export` | Exports watchlist to a JSON file. | `<path>` |
 | `import` | Imports watchlist from a JSON file. | `<path>` |
 | `backup` | Backs up the SQLite database. | `<path>` |
@@ -75,11 +77,12 @@ The system uses `better-sqlite3` and automatic schema migrations.
 ## Recovery Procedures
 
 If the watcher daemon crashes or enters an unstable state:
-1. Stop the process: `npm run stop`
-2. Check the logs: `tail -n 100 data/daemon.log`
+1. Stop the process: `npm run stop` (asks the daemon to shut down, and kills it if it has not exited after 45 seconds)
+2. Check the logs: `tail -n 100 data/daemon.log` (PowerShell: `Get-Content data\daemon.log -Tail 100`)
 3. Check the database health: `npm run dev doctor`
-4. If there's a stalled process, use `kill -9 $(cat data/watcher.pid)`.
-5. Restart: `npm run start`
+4. Restart: `npm run start`
+
+A leftover `data/watcher.pid` from a crash is harmless: the daemon refreshes that file every few seconds while it runs, and a stale one is ignored and cleaned up.
 
 ## Troubleshooting Guide
 
@@ -94,3 +97,19 @@ If the watcher daemon crashes or enters an unstable state:
 
 **3. Telegram Uploads Failing for Large Files**
 - If an upload fails silently or with a "413 Request Entity Too Large" error, ensure your local Telegram Bot API Docker container is running (`docker compose ps`) and `TELEGRAM_API_URL` is set correctly in `.env`.
+
+**4. No screenshots ("Failed to start Camoufox")**
+- Screenshots need the Python side: `python -m pip install -r requirements.txt` and `python -m camoufox fetch` (inside `.venv`, see the README).
+- `playwright` in `requirements.txt` and `playwright-core` in `package.json` must be on the same minor version; update them together.
+- After a failed launch the watcher retries on its own every couple of minutes; tweets are still posted without a screenshot in the meantime.
+
+**5. "Twitter Auth Failure" alert**
+- The session cookies were rejected. Put fresh `auth_token` / `ct0` values in `.env` (`npm run dev -- update-tokens`, or `npm run login`) and restart the watcher.
+- The alert is sent at most once every six hours.
+
+**6. "Watcher problem" / "Recovered" messages**
+- Sent by the built-in health monitor (see "Running 24/7" in the README). `X API` failing usually means dead session cookies (401), a rate limit (429) or a changed API; the alert quotes the last error.
+- `tweet polling` stuck means a polling cycle has not finished for 30 minutes; restart the watcher and check `data/daemon.log` for the last thing it was doing.
+
+**7. The watcher came back by itself after I killed it**
+- That is the auto-restart task (Windows) or systemd (Linux). Use `npm run stop` / `systemctl stop x-watcher` for a stop that sticks.

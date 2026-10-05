@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import axios, { AxiosError, AxiosInstance, AxiosResponse } from 'axios';
 import FormData from 'form-data';
-import { AppConfig, TelegramClient, TelegramMediaItem } from '../types';
+import { AppConfig, HealthReporter, TelegramClient, TelegramMediaItem } from '../types';
 import { rootLogger } from '../runtime/logger';
+import { sleep } from '../utils/async';
 
 const PUBLIC_API = 'https://api.telegram.org';
 
@@ -24,7 +25,13 @@ export class TelegramBotApiClient implements TelegramClient {
 
   private readonly http: AxiosInstance;
 
-  constructor(private readonly config: AppConfig, http?: AxiosInstance) {
+  /** Telegram's explanation of the most recent failed request. */
+  private lastFailureDescription: string | null = null;
+
+  /** Topic used for notices once the General topic turned out to be closed. */
+  private closedGeneralFallback: string | null = null;
+
+  constructor(private readonly config: AppConfig, http?: AxiosInstance, private readonly health?: HealthReporter) {
     this.http = http ?? axios.create();
   }
 
@@ -37,21 +44,59 @@ export class TelegramBotApiClient implements TelegramClient {
       return false;
     }
 
-    const payload: Record<string, string | boolean> = {
-      chat_id: this.config.telegramChatId!,
-      text: message,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
+    const send = (thread: string | null): Promise<boolean> => {
+      const payload: Record<string, string | boolean> = {
+        chat_id: this.config.telegramChatId!,
+        text: message,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      };
+      if (thread) {
+        payload.message_thread_id = thread;
+      }
+      return this.requestWithFallback((baseUrl) =>
+        this.http.post(`${baseUrl}/bot${this.config.telegramBotToken}/sendMessage`, payload, { timeout: 10000 })
+      );
     };
 
-    const safe = safeThreadId(threadId);
-    if (safe) {
-      payload.message_thread_id = safe;
+    const explicit = safeThreadId(threadId);
+    if (explicit) {
+      return send(explicit);
     }
 
-    return this.requestWithFallback((baseUrl) =>
-      this.http.post(`${baseUrl}/bot${this.config.telegramBotToken}/sendMessage`, payload, { timeout: 10000 })
-    );
+    // A notice with no topic of its own (started/stopped, Space live, health alerts).
+    const noticeThread = safeThreadId(this.config.telegramStatusThreadId) ?? this.closedGeneralFallback;
+    if (noticeThread) {
+      return send(noticeThread);
+    }
+
+    if (await send(null)) {
+      return true;
+    }
+
+    // In a forum group whose General topic is closed, Telegram rejects every
+    // message without a topic. Rather than lose all notices (including health
+    // alerts), post them in a topic that is known to be open.
+    if (this.lastFailureDescription?.includes('TOPIC_CLOSED')) {
+      const fallback = [
+        this.config.telegramMetadataThreadId,
+        this.config.telegramTweetMetadataThreadId,
+        this.config.telegramAudioThreadId,
+        this.config.telegramTweetThreadId,
+      ]
+        .map((id) => safeThreadId(id))
+        .find(Boolean);
+      if (fallback) {
+        this.closedGeneralFallback = fallback;
+        this.logger.warn(
+          'The General topic of the Telegram group is closed; watcher notices will go to another topic. Set TELEGRAM_STATUS_THREAD_ID to choose which.',
+          { topic: fallback }
+        );
+        return send(fallback);
+      }
+    }
+
+    return false;
   }
 
   async sendPhoto(filePath: string, caption?: string, threadId?: string | null): Promise<boolean> {
@@ -98,7 +143,7 @@ export class TelegramBotApiClient implements TelegramClient {
         }
 
         await this.sendMessage(
-          `<b>Upload Failed</b>\n\nFile <code>${path.basename(filePath)}</code> is too large for the public Telegram Bot API.`
+          `❌ <b>Upload failed</b>\n\n<code>${path.basename(filePath)}</code> is too large for the public Telegram Bot API (50 MB limit).\nIs the local Bot API server running?`
         );
       },
     });
@@ -226,11 +271,36 @@ export class TelegramBotApiClient implements TelegramClient {
     request: (baseUrl: string) => Promise<AxiosResponse<T>>,
     onFallbackFailure?: (error: AxiosError) => Promise<void>
   ): Promise<boolean> {
+    const delivered = await this.tryRequest(request, onFallbackFailure);
+    if (delivered) {
+      this.health?.ok('telegram');
+    } else {
+      this.health?.fail('telegram', 'Telegram request failed');
+    }
+    return delivered;
+  }
+
+  private async tryRequest<T>(
+    request: (baseUrl: string) => Promise<AxiosResponse<T>>,
+    onFallbackFailure?: (error: AxiosError) => Promise<void>,
+    retried = false
+  ): Promise<boolean> {
     try {
       const response = await request(this.apiUrl);
       return response.status === 200;
     } catch (error) {
       const axiosError = error as AxiosError;
+      const body = axiosError.response?.data as { description?: string; parameters?: { retry_after?: number } } | undefined;
+      this.lastFailureDescription = body?.description ?? null;
+
+      // Rate limited: Telegram says how long to wait. One patient retry beats dropping the message.
+      const retryAfter = axiosError.response?.status === 429 ? Number(body?.parameters?.retry_after) : NaN;
+      if (!retried && Number.isFinite(retryAfter)) {
+        const waitSeconds = Math.min(Math.max(retryAfter, 1), 60);
+        this.logger.warn('Telegram rate limit hit, retrying after the requested pause', { waitSeconds });
+        await sleep(waitSeconds * 1000 + 500);
+        return this.tryRequest(request, onFallbackFailure, true);
+      }
       if (this.isLocalServerConfigured && isFallbackCandidate(axiosError)) {
         this.logger.warn('Local Telegram API unavailable, falling back to public API');
         try {
@@ -253,6 +323,8 @@ export class TelegramBotApiClient implements TelegramClient {
       this.logger.error('Telegram request failed', {
         message: axiosError.message,
         status: axiosError.response?.status,
+        // Telegram's own explanation, e.g. "Bad Request: PHOTO_INVALID_DIMENSIONS".
+        description: body?.description,
       });
       return false;
     }

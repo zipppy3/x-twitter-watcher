@@ -1,8 +1,8 @@
 import * as cheerio from 'cheerio';
-import { Camoufox } from 'camoufox-js';
-import { AppConfig, Tweet, TwitterClient, TweetMedia } from '../types';
+import { AppConfig, HealthReporter, Tweet, TwitterClient, TweetMedia } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { ProxyRotator, PlaywrightProxyConfig } from '../utils/proxy-rotator';
+import { CamoufoxBrowser } from './camoufox-browser';
 
 interface NitterInstance {
   url: string;
@@ -15,8 +15,6 @@ export class NitterApiClient implements TwitterClient {
   private readonly logger = rootLogger.child('nitter');
   private readonly instances: NitterInstance[] = [];
   private activeIndex = 0;
-  private browser: any | null = null;
-  private browserAvailable = true;
   private readonly proxyRotator: ProxyRotator;
 
   /** After this many consecutive failures, start trying fallbacks */
@@ -26,7 +24,9 @@ export class NitterApiClient implements TwitterClient {
 
   constructor(
     private readonly config: AppConfig,
+    private readonly camoufox: CamoufoxBrowser,
     proxyRotator?: ProxyRotator,
+    private readonly health?: HealthReporter,
   ) {
     const primary = config.nitterUrl?.replace(/\/$/, '') || 'https://nitter.net';
     this.instances.push({ url: primary, failureCount: 0, lastFailure: null, cooldownUntil: null });
@@ -114,18 +114,8 @@ export class NitterApiClient implements TwitterClient {
     }
   }
 
-  private async ensureBrowser(): Promise<any | null> {
-    if (!this.browserAvailable) return null;
-    if (!this.browser) {
-      try {
-        this.browser = await Camoufox({ headless: true });
-      } catch (error) {
-        this.browserAvailable = false;
-        this.logger.error('Failed to start Camoufox for nitter', { message: (error as Error).message });
-        return null;
-      }
-    }
-    return this.browser;
+  private ensureBrowser(): Promise<any | null> {
+    return this.camoufox.get();
   }
 
   private async getHtml(url: string, useProxy: boolean): Promise<string> {
@@ -200,16 +190,19 @@ export class NitterApiClient implements TwitterClient {
           try {
             const html = await tryFetch(false);
             this.markInstanceSuccess(instance);
+            this.health?.ok('nitter');
             return html;
           } catch (error) {
             this.logger.warn('Nitter direct connection failed, falling back to proxy', { url, message: (error as Error).message });
             const html = await tryFetch(true);
             this.markInstanceSuccess(instance);
+            this.health?.ok('nitter');
             return html;
           }
         } else {
           const html = await tryFetch(true);
           this.markInstanceSuccess(instance);
+          this.health?.ok('nitter');
           return html;
         }
       } catch (error) {
@@ -223,6 +216,7 @@ export class NitterApiClient implements TwitterClient {
       }
     }
 
+    this.health?.fail('nitter', 'All Nitter instances failed');
     throw new Error('All Nitter instances failed');
   }
 

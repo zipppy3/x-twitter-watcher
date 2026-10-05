@@ -18,6 +18,15 @@ function readNullableEnv(key: string): string | null {
   return value;
 }
 
+/** Empty means the default (09:00); "off" or anything that is not an hour disables the report. */
+function parseReportHour(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === '') {
+    return 9;
+  }
+  const hour = Number(value);
+  return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : null;
+}
+
 export interface AppConfigOptions {
   envPath?: string;
   dbPath?: string;
@@ -66,7 +75,11 @@ export function loadAppConfig(options: AppConfigOptions = {}): AppConfig {
     telegramMetadataThreadId: readNullableEnv('TELEGRAM_METADATA_THREAD_ID'),
     telegramTweetThreadId: readNullableEnv('TELEGRAM_TWEET_THREAD_ID'),
     telegramTweetMetadataThreadId: readNullableEnv('TELEGRAM_TWEET_METADATA_THREAD_ID'),
+    telegramStatusThreadId: readNullableEnv('TELEGRAM_STATUS_THREAD_ID'),
     autoDeleteUploaded: parseBoolean(process.env.AUTO_DELETE_UPLOADED, false),
+    screenshotLoggedIn: parseBoolean(process.env.SCREENSHOT_LOGGED_IN, false),
+    healthAlertAfterMs: (Number(process.env.HEALTH_ALERT_AFTER_MINUTES) || 15) * 60 * 1000,
+    healthDailyReportHour: parseReportHour(process.env.HEALTH_DAILY_REPORT_HOUR),
     tweetPollIntervalsMs: [60000, 120000],
     tweetBootstrapDelayMs: 5000,
     screenshotTimeoutMs: 60000,
