@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import axios, { AxiosError, AxiosInstance, AxiosResponse } from 'axios';
 import FormData from 'form-data';
-import { AppConfig, HealthReporter, TelegramClient, TelegramMediaItem } from '../types';
+import { AppConfig, HealthReporter, TelegramClient, TelegramMediaItem, TelegramReceipt } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { sleep } from '../utils/async';
 
@@ -14,6 +14,12 @@ function safeThreadId(threadId?: string | null): string | null {
   }
   const value = Number(threadId);
   return Number.isFinite(value) && value > 0 ? String(value) : null;
+}
+
+/** sendMediaGroup answers with a list of messages; the first one carries the caption. */
+function extractMessageId(data: any): number | undefined {
+  const result = Array.isArray(data?.result) ? data.result[0] : data?.result;
+  return typeof result?.message_id === 'number' ? result.message_id : undefined;
 }
 
 function isFallbackCandidate(error: AxiosError): boolean {
@@ -39,7 +45,7 @@ export class TelegramBotApiClient implements TelegramClient {
     return Boolean(this.config.telegramBotToken && this.config.telegramChatId);
   }
 
-  async sendMessage(message: string, threadId?: string | null): Promise<boolean> {
+  async sendMessage(message: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean> {
     if (!this.isConfigured()) {
       return false;
     }
@@ -54,8 +60,11 @@ export class TelegramBotApiClient implements TelegramClient {
       if (thread) {
         payload.message_thread_id = thread;
       }
-      return this.requestWithFallback((baseUrl) =>
-        this.http.post(`${baseUrl}/bot${this.config.telegramBotToken}/sendMessage`, payload, { timeout: 10000 })
+      return this.requestWithFallback(
+        (baseUrl) =>
+          this.http.post(`${baseUrl}/bot${this.config.telegramBotToken}/sendMessage`, payload, { timeout: 10000 }),
+        undefined,
+        receipt
       );
     };
 
@@ -99,18 +108,30 @@ export class TelegramBotApiClient implements TelegramClient {
     return false;
   }
 
-  async sendPhoto(filePath: string, caption?: string, threadId?: string | null): Promise<boolean> {
+  async sendPhoto(
+    filePath: string,
+    caption?: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt
+  ): Promise<boolean> {
     return this.uploadFile('sendPhoto', 'photo', filePath, {
       caption,
       threadId,
+      receipt,
       timeout: 30000,
     });
   }
 
-  async sendVideo(filePath: string, caption?: string, threadId?: string | null): Promise<boolean> {
+  async sendVideo(
+    filePath: string,
+    caption?: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt
+  ): Promise<boolean> {
     return this.uploadFile('sendVideo', 'video', filePath, {
       caption,
       threadId,
+      receipt,
       timeout: 120000,
       extraFields: {
         supports_streaming: 'true',
@@ -151,7 +172,12 @@ export class TelegramBotApiClient implements TelegramClient {
     return result;
   }
 
-  async sendMediaGroup(items: TelegramMediaItem[], caption?: string, threadId?: string | null): Promise<boolean> {
+  async sendMediaGroup(
+    items: TelegramMediaItem[],
+    caption?: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt
+  ): Promise<boolean> {
     if (!this.isConfigured() || !items.length) {
       return false;
     }
@@ -164,8 +190,8 @@ export class TelegramBotApiClient implements TelegramClient {
     if (validItems.length === 1) {
       const [item] = validItems;
       return item.type === 'video'
-        ? this.sendVideo(item.path, caption, threadId)
-        : this.sendPhoto(item.path, caption, threadId);
+        ? this.sendVideo(item.path, caption, threadId, receipt)
+        : this.sendPhoto(item.path, caption, threadId, receipt);
     }
 
     const limitedItems = validItems.slice(0, 10);
@@ -209,7 +235,7 @@ export class TelegramBotApiClient implements TelegramClient {
         maxBodyLength: Infinity,
         timeout: 120000,
       });
-    });
+    }, undefined, receipt);
   }
 
   private get apiUrl(): string {
@@ -227,6 +253,7 @@ export class TelegramBotApiClient implements TelegramClient {
     options: {
       caption?: string;
       threadId?: string | null;
+      receipt?: TelegramReceipt;
       timeout: number;
       extraFields?: Record<string, string>;
       onFallbackFailure?: (error: AxiosError) => Promise<void>;
@@ -264,14 +291,15 @@ export class TelegramBotApiClient implements TelegramClient {
         maxBodyLength: Infinity,
         timeout: options.timeout,
       });
-    }, options.onFallbackFailure);
+    }, options.onFallbackFailure, options.receipt);
   }
 
   private async requestWithFallback<T>(
     request: (baseUrl: string) => Promise<AxiosResponse<T>>,
-    onFallbackFailure?: (error: AxiosError) => Promise<void>
+    onFallbackFailure?: (error: AxiosError) => Promise<void>,
+    receipt?: TelegramReceipt
   ): Promise<boolean> {
-    const delivered = await this.tryRequest(request, onFallbackFailure);
+    const delivered = await this.tryRequest(request, onFallbackFailure, receipt);
     if (delivered) {
       this.health?.ok('telegram');
     } else {
@@ -283,11 +311,21 @@ export class TelegramBotApiClient implements TelegramClient {
   private async tryRequest<T>(
     request: (baseUrl: string) => Promise<AxiosResponse<T>>,
     onFallbackFailure?: (error: AxiosError) => Promise<void>,
+    receipt?: TelegramReceipt,
     retried = false
   ): Promise<boolean> {
+    const succeeded = (response: AxiosResponse<T>): boolean => {
+      if (response.status !== 200) {
+        return false;
+      }
+      if (receipt) {
+        receipt.messageId = extractMessageId(response.data);
+      }
+      return true;
+    };
+
     try {
-      const response = await request(this.apiUrl);
-      return response.status === 200;
+      return succeeded(await request(this.apiUrl));
     } catch (error) {
       const axiosError = error as AxiosError;
       const body = axiosError.response?.data as { description?: string; parameters?: { retry_after?: number } } | undefined;
@@ -299,13 +337,12 @@ export class TelegramBotApiClient implements TelegramClient {
         const waitSeconds = Math.min(Math.max(retryAfter, 1), 60);
         this.logger.warn('Telegram rate limit hit, retrying after the requested pause', { waitSeconds });
         await sleep(waitSeconds * 1000 + 500);
-        return this.tryRequest(request, onFallbackFailure, true);
+        return this.tryRequest(request, onFallbackFailure, receipt, true);
       }
       if (this.isLocalServerConfigured && isFallbackCandidate(axiosError)) {
         this.logger.warn('Local Telegram API unavailable, falling back to public API');
         try {
-          const response = await request(PUBLIC_API);
-          return response.status === 200;
+          return succeeded(await request(PUBLIC_API));
         } catch (fallbackError) {
           if (onFallbackFailure) {
             await onFallbackFailure(fallbackError as AxiosError);

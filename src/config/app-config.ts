@@ -27,6 +27,15 @@ function parseReportHour(value: string | undefined): number | null {
   return Number.isInteger(hour) && hour >= 0 && hour <= 23 ? hour : null;
 }
 
+/** Empty means the default (30 days); 0, "off" or anything that is not a number disables the check. */
+function parseCheckDays(value: string | undefined): number {
+  if (value === undefined || value.trim() === '') {
+    return 30;
+  }
+  const days = Number(value);
+  return Number.isFinite(days) && days > 0 ? days : 0;
+}
+
 export interface AppConfigOptions {
   envPath?: string;
   dbPath?: string;
@@ -76,6 +85,10 @@ export function loadAppConfig(options: AppConfigOptions = {}): AppConfig {
     telegramTweetThreadId: readNullableEnv('TELEGRAM_TWEET_THREAD_ID'),
     telegramTweetMetadataThreadId: readNullableEnv('TELEGRAM_TWEET_METADATA_THREAD_ID'),
     telegramStatusThreadId: readNullableEnv('TELEGRAM_STATUS_THREAD_ID'),
+    telegramDeletedThreadId: readNullableEnv('TELEGRAM_DELETED_THREAD_ID'),
+    deletedTweetCheckDays: parseCheckDays(process.env.DELETED_TWEET_CHECK_DAYS),
+    deletionCheckIntervalMs: 5 * 60 * 1000,
+    deletionCheckBatchSize: 10,
     autoDeleteUploaded: parseBoolean(process.env.AUTO_DELETE_UPLOADED, false),
     screenshotLoggedIn: parseBoolean(process.env.SCREENSHOT_LOGGED_IN, false),
     healthAlertAfterMs: (Number(process.env.HEALTH_ALERT_AFTER_MINUTES) || 15) * 60 * 1000,

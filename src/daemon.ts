@@ -10,6 +10,7 @@ import { CamoufoxScreenshotService } from './adapters/screenshot-service';
 import { TwspaceSpacesProvider } from './adapters/spaces-provider';
 import { TweetMonitorWorker } from './core/tweet-monitor-worker';
 import { SpaceMonitorWorker } from './core/space-monitor-worker';
+import { DeletionCheckWorker } from './core/deletion-check-worker';
 import { TelegramControlBot } from './bot/telegram-bot';
 import { WatcherSupervisor } from './core/supervisor';
 import { HealthMonitor } from './core/health-monitor';
@@ -88,6 +89,9 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
   const spacesProvider = new TwspaceSpacesProvider(config, (reason) => twitterClient.refreshAuth(reason), health);
   const tweetWorker = new TweetMonitorWorker(config, storage, tweetWorkerClient, telegramClient, screenshotService, health);
   const spaceWorker = new SpaceMonitorWorker(config, storage, spacesProvider, telegramClient, health);
+  // Tweet ids from Nitter are the same ids, but only the X API can say whether one still exists.
+  const deletionWorker =
+    config.dataSource === 'nitter' ? undefined : new DeletionCheckWorker(config, storage, twitterClient, telegramClient, health);
   let supervisor: WatcherSupervisor;
   const controlBot = new TelegramControlBot(config, watchlistService, () => supervisor.getStatus());
 
@@ -99,7 +103,8 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
     spaceWorker,
     screenshotService,
     telegramClient,
-    controlBot
+    controlBot,
+    deletionWorker
   );
 
   let shuttingDown = false;

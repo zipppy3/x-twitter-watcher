@@ -30,6 +30,13 @@ export interface AppConfig {
   telegramTweetMetadataThreadId: string | null;
   /** Topic for watcher notices (started/stopped, Space live, health alerts). Empty = the group's General topic. */
   telegramStatusThreadId: string | null;
+  /** Topic for "tweet deleted" notices. Empty = the topic the tweet itself was posted in. */
+  telegramDeletedThreadId: string | null;
+  /** How many days a posted tweet keeps being checked for deletion. 0 turns the check off. */
+  deletedTweetCheckDays: number;
+  deletionCheckIntervalMs: number;
+  /** Most tweets looked up per deletion-check cycle, so the check cannot eat the X rate limit. */
+  deletionCheckBatchSize: number;
   autoDeleteUploaded: boolean;
   /** Take X screenshots with the account's session (shows whole threads) instead of logged out. */
   screenshotLoggedIn: boolean;
@@ -55,7 +62,7 @@ export interface HealthReporter {
   /** The tweet polling loop finished a cycle. */
   beat(): void;
   /** Something was delivered (shown in the daily report). */
-  count(what: 'tweets' | 'spaces'): void;
+  count(what: 'tweets' | 'spaces' | 'deleted'): void;
 }
 
 export interface WatchTarget {
@@ -179,6 +186,49 @@ export interface TelegramMediaItem {
   path: string;
 }
 
+/** Filled in by a send call that succeeded, for callers that need to link back to the message. */
+export interface TelegramReceipt {
+  messageId?: number;
+}
+
+/** A tweet that was posted to Telegram and is still being checked for deletion. */
+export interface DeliveredTweet {
+  username: string;
+  tweetId: string;
+  text: string;
+  /** When the tweet was posted on X (ISO), or null when that could not be parsed. */
+  postedAt: string | null;
+  deliveredAt: string;
+  telegramMessageId: number | null;
+  lastCheckedAt: string | null;
+  nextCheckAt: string;
+  /** Lookups in a row that found the tweet gone. */
+  missingCount: number;
+  deletedAt: string | null;
+}
+
+export interface DeliveredTweetInput {
+  tweetId: string;
+  text: string;
+  postedAt: string | null;
+  telegramMessageId: number | null;
+  nextCheckAt: string;
+}
+
+/**
+ * `gone`: X answered and has no such tweet. `unavailable`: X hides it for another
+ * reason (suspended or protected account, withheld). `unknown`: the request failed
+ * or the answer was not understood, which says nothing about the tweet.
+ */
+export type TweetStatus = 'exists' | 'gone' | 'unavailable' | 'unknown';
+
+export type AccountStatus = 'visible' | 'unavailable' | 'unknown';
+
+export interface TweetStatusSource {
+  getTweetStatus(tweetId: string): Promise<TweetStatus>;
+  getAccountStatus(username: string): Promise<AccountStatus>;
+}
+
 export interface SpaceLiveEvent {
   spaceId: string;
   title: string;
@@ -220,6 +270,21 @@ export interface Storage {
   markTweetsSeen(username: string, ids: string[]): void;
   deleteSeenTweets(username: string): void;
   renameWatchTarget(oldUsername: string, newUsername: string): boolean;
+  trackDeliveredTweets(username: string, tweets: DeliveredTweetInput[]): void;
+  /** Tweets of one account that are still being checked for deletion. */
+  getTrackedTweets(username: string): DeliveredTweet[];
+  getDueDeletionChecks(now: string, limit: number): DeliveredTweet[];
+  /** Pull the next check of these tweets forward to `now`. */
+  requestDeletionCheck(username: string, tweetIds: string[], now: string): void;
+  recordDeletionCheck(
+    username: string,
+    tweetId: string,
+    result: { checkedAt: string; missingCount: number; nextCheckAt: string }
+  ): void;
+  markTweetDeleted(username: string, tweetId: string, deletedAt: string): void;
+  /** Forget tracked tweets delivered before `cutoff`; returns how many were dropped. */
+  pruneDeliveredTweets(cutoff: string): number;
+  forgetDeliveredTweets(username: string): void;
   getRuntimeState(): RuntimeState;
   updateRuntimeState(patch: Partial<RuntimeState>): RuntimeState;
   setActiveSpaces(activeSpaces: ActiveSpace[]): RuntimeState;
@@ -242,15 +307,20 @@ export interface TwitterClient {
 
 export interface TelegramClient {
   isConfigured(): boolean;
-  sendMessage(message: string, threadId?: string | null): Promise<boolean>;
-  sendPhoto(filePath: string, caption?: string, threadId?: string | null): Promise<boolean>;
-  sendVideo(filePath: string, caption?: string, threadId?: string | null): Promise<boolean>;
+  sendMessage(message: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
+  sendPhoto(filePath: string, caption?: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
+  sendVideo(filePath: string, caption?: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
   sendDocument(filePath: string, threadId?: string | null): Promise<boolean>;
   sendAudio(
     filePath: string,
     options?: { title?: string; performer?: string; durationSec?: number; threadId?: string | null }
   ): Promise<boolean>;
-  sendMediaGroup(items: TelegramMediaItem[], caption?: string, threadId?: string | null): Promise<boolean>;
+  sendMediaGroup(
+    items: TelegramMediaItem[],
+    caption?: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt
+  ): Promise<boolean>;
 }
 
 export interface ScreenshotService {

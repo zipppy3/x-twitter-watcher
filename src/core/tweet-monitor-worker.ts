@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import axios from 'axios';
-import { AppConfig, HealthReporter, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, Tweet, TwitterClient, WatchTarget } from '../types';
+import { AppConfig, HealthReporter, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, TelegramReceipt, Tweet, TwitterClient, WatchTarget } from '../types';
+import { FIRST_DELETION_CHECK_DELAY_MS, MIN_RECHECK_GAP_MS } from './deletion-check-worker';
 import { rootLogger } from '../runtime/logger';
 import { ensureFileDir, sanitizeFilename } from '../utils/files';
 import { sleep, randomSleep } from '../utils/async';
@@ -219,6 +220,8 @@ export class TweetMonitorWorker {
       }
     }
 
+    this.flagTweetsMissingFromTimeline(target.username, tweets);
+
     const seenIds = new Set(this.storage.getSeenTweetIds(target.username));
     if (!seenIds.size) {
       // Retweets are remembered too: a timeline made only of retweets would otherwise
@@ -315,6 +318,74 @@ export class TweetMonitorWorker {
       // delays the remaining tweets instead of silently dropping them.
       this.storage.markTweetsSeen(watched.username, unit.ids);
       await randomSleep(3000, 6000);
+    }
+  }
+
+  private get tracksDeletions(): boolean {
+    return this.config.deletedTweetCheckDays > 0 && this.config.dataSource !== 'nitter';
+  }
+
+  /**
+   * A free hint for the deletion check: a posted tweet that should be on this
+   * page of the timeline but is not gets looked up soon instead of at its next
+   * regular check. Only a hint (timelines collapse threads and skip posts), so
+   * nothing is reported from here.
+   */
+  private flagTweetsMissingFromTimeline(username: string, timeline: Tweet[]): void {
+    // A short page says too little about what "should" be on it.
+    if (!this.tracksDeletions || timeline.length < 5) {
+      return;
+    }
+
+    try {
+      const present = new Set(timeline.map((tweet) => tweet.id));
+      const ids = [...present].map((id) => BigInt(id)).sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+      // The oldest entry may be a pinned tweet from long ago, so the page is taken to start at the second oldest.
+      const oldestOnPage = ids[1];
+      const recheckBefore = Date.now() - MIN_RECHECK_GAP_MS;
+
+      const missing = this.storage
+        .getTrackedTweets(username)
+        .filter(
+          (tracked) =>
+            !present.has(tracked.tweetId) &&
+            BigInt(tracked.tweetId) > oldestOnPage &&
+            (!tracked.lastCheckedAt || new Date(tracked.lastCheckedAt).getTime() < recheckBefore)
+        )
+        .map((tracked) => tracked.tweetId);
+
+      if (missing.length) {
+        this.storage.requestDeletionCheck(username, missing, new Date().toISOString());
+      }
+    } catch (error) {
+      this.logger.warn('Could not compare the timeline with posted tweets', { username, message: (error as Error).message });
+    }
+  }
+
+  /** Remember what was posted, so the deletion check can come back to it. */
+  private trackDelivered(tweets: Tweet[], target: WatchTarget, messageId: number | undefined): void {
+    if (!this.tracksDeletions) {
+      return;
+    }
+
+    try {
+      const nextCheckAt = new Date(Date.now() + FIRST_DELETION_CHECK_DELAY_MS).toISOString();
+      this.storage.trackDeliveredTweets(
+        target.username,
+        tweets.map((tweet) => {
+          const postedAt = new Date(tweet.createdAt);
+          return {
+            tweetId: tweet.id,
+            text: tweet.text.slice(0, 1000),
+            postedAt: Number.isNaN(postedAt.getTime()) ? null : postedAt.toISOString(),
+            telegramMessageId: messageId ?? null,
+            nextCheckAt,
+          };
+        })
+      );
+    } catch (error) {
+      // Tracking is an extra; the tweet itself was delivered.
+      this.logger.warn('Could not record a posted tweet for the deletion check', { message: (error as Error).message });
     }
   }
 
@@ -554,10 +625,11 @@ export class TweetMonitorWorker {
       allFiles.push(item.path);
     }
 
-    const { delivered, mediaSent } = await this.sendNotification(mediaItems, message, topicId);
+    const { delivered, mediaSent, messageId } = await this.sendNotification(mediaItems, message, topicId);
     if (!delivered) {
       return false;
     }
+    this.trackDelivered([tweet], target, messageId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];
@@ -647,10 +719,11 @@ export class TweetMonitorWorker {
     const message = buildThreadMessage(tweets, target.username);
 
     const topicId = getTopicId(this.config, target, 'tweet');
-    const { delivered, mediaSent } = await this.sendNotification(mediaItems, message, topicId);
+    const { delivered, mediaSent, messageId } = await this.sendNotification(mediaItems, message, topicId);
     if (!delivered) {
       return false;
     }
+    this.trackDelivered(tweets, target, messageId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];
@@ -675,33 +748,35 @@ export class TweetMonitorWorker {
     mediaItems: TelegramMediaItem[],
     message: string,
     topicId: string | null
-  ): Promise<{ delivered: boolean; mediaSent: boolean }> {
+  ): Promise<{ delivered: boolean; mediaSent: boolean; messageId?: number }> {
     if (!this.telegramClient.isConfigured()) {
       // Nothing to deliver to: the files saved on disk are the result.
       return { delivered: true, mediaSent: false };
     }
 
+    // Filled in by whichever send succeeds; a deletion notice links back to it.
+    const receipt: TelegramReceipt = {};
+
     if (!mediaItems.length) {
-      return { delivered: await this.telegramClient.sendMessage(message, topicId), mediaSent: false };
+      const delivered = await this.telegramClient.sendMessage(message, topicId, receipt);
+      return { delivered, mediaSent: false, messageId: receipt.messageId };
     }
 
     let mediaSent: boolean;
     if (mediaItems.length >= 2) {
-      mediaSent = await this.telegramClient.sendMediaGroup(mediaItems, message, topicId);
+      mediaSent = await this.telegramClient.sendMediaGroup(mediaItems, message, topicId, receipt);
     } else {
       mediaSent =
         mediaItems[0].type === 'video'
-          ? await this.telegramClient.sendVideo(mediaItems[0].path, message, topicId)
-          : await this.telegramClient.sendPhoto(mediaItems[0].path, message, topicId);
+          ? await this.telegramClient.sendVideo(mediaItems[0].path, message, topicId, receipt)
+          : await this.telegramClient.sendPhoto(mediaItems[0].path, message, topicId, receipt);
     }
     if (mediaSent) {
-      return { delivered: true, mediaSent: true };
+      return { delivered: true, mediaSent: true, messageId: receipt.messageId };
     }
 
     this.logger.warn('Media upload failed, sending the notification as text only');
-    return {
-      delivered: await this.telegramClient.sendMessage(message + MEDIA_MISSING_NOTE, topicId),
-      mediaSent: false,
-    };
+    const delivered = await this.telegramClient.sendMessage(message + MEDIA_MISSING_NOTE, topicId, receipt);
+    return { delivered, mediaSent: false, messageId: receipt.messageId };
   }
 }

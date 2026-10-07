@@ -93,6 +93,14 @@ npm run catchup            # mark everything currently on the timelines as seen
 npm run dev -- start --clean
 ```
 
+#### Deleted tweets
+Every tweet that was posted to Telegram is checked again later. When it has been deleted on X, a **🗑 Tweet deleted** notice goes to the `TELEGRAM_DELETED_THREAD_ID` topic (or, without one, the topic the tweet was posted in) with the tweet's text and a link to the copy that was saved in the group when it was posted.
+
+- Tweets are checked hourly on their first day, twice a day in their first week, then every two days, for `DELETED_TWEET_CHECK_DAYS` days (default 30, `0` to turn it off). A tweet that disappears from the account's timeline is looked up right away.
+- A deletion is reported only after two lookups, ten minutes apart, both found the tweet gone. Expect a notice within about an hour for a recent tweet, later for old ones.
+- A failed or rate-limited request never counts as a deletion. A suspended, deactivated or private account produces one **⚠️ Account unavailable** notice instead of one per tweet.
+- Only tweets posted after this feature was installed are tracked, and only with `DATA_SOURCE=twitter`.
+
 ## Running 24/7
 
 ### Health alerts

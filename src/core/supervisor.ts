@@ -5,6 +5,7 @@ import { formatUptime } from '../utils/time';
 import { WatchlistService } from '../services/watchlist-service';
 import { TweetMonitorWorker } from './tweet-monitor-worker';
 import { SpaceMonitorWorker } from './space-monitor-worker';
+import { DeletionCheckWorker } from './deletion-check-worker';
 import { TelegramControlBot } from '../bot/telegram-bot';
 import { buildStartedMessage, buildStoppedMessage } from '../services/telegram-messages';
 
@@ -21,7 +22,8 @@ export class WatcherSupervisor {
     private readonly spaceWorker: SpaceMonitorWorker,
     private readonly screenshotService: ScreenshotService,
     private readonly notificationClient: TelegramClient,
-    private readonly controlBot: TelegramControlBot
+    private readonly controlBot: TelegramControlBot,
+    private readonly deletionWorker?: DeletionCheckWorker
   ) {}
 
   async start(mode = 'daemon'): Promise<void> {
@@ -50,6 +52,7 @@ export class WatcherSupervisor {
 
     await this.spaceWorker.start();
     await this.tweetWorker.start();
+    await this.deletionWorker?.start();
     await this.controlBot.start();
 
     const targets = this.storage.getWatchTargets();
@@ -83,6 +86,7 @@ export class WatcherSupervisor {
     }
 
     await this.controlBot.stop();
+    await this.deletionWorker?.stop();
     await this.tweetWorker.stop();
     await this.spaceWorker.stop();
     await this.screenshotService.close();

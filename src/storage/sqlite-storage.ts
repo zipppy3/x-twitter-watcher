@@ -1,5 +1,14 @@
 import Database from 'better-sqlite3';
-import { ActiveSpace, RecordingRecord, RuntimeState, Storage, WatchTarget, WatchTargetInput } from '../types';
+import {
+  ActiveSpace,
+  DeliveredTweet,
+  DeliveredTweetInput,
+  RecordingRecord,
+  RuntimeState,
+  Storage,
+  WatchTarget,
+  WatchTargetInput,
+} from '../types';
 import { ensureFileDir } from '../utils/files';
 
 const DEFAULT_RUNTIME_STATE: RuntimeState = {
@@ -33,6 +42,21 @@ function rowToWatchTarget(row: any): WatchTarget {
     telegramTweetMetadataTopicId: row.telegram_tweet_metadata_topic_id,
     addedAt: row.added_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToDeliveredTweet(row: any): DeliveredTweet {
+  return {
+    username: row.username,
+    tweetId: row.tweet_id,
+    text: row.text,
+    postedAt: row.posted_at,
+    deliveredAt: row.delivered_at,
+    telegramMessageId: row.telegram_message_id,
+    lastCheckedAt: row.last_checked_at,
+    nextCheckAt: row.next_check_at,
+    missingCount: row.missing_count,
+    deletedAt: row.deleted_at,
   };
 }
 
@@ -154,6 +178,29 @@ export class SqliteStorage implements Storage {
       }
       
       this.db.pragma('user_version = 1');
+    }
+
+    if ((this.db.pragma('user_version', { simple: true }) as number) < 2) {
+      // Tweets that reached Telegram, kept so they can be checked for deletion later.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS delivered_tweets (
+          username TEXT NOT NULL,
+          tweet_id TEXT NOT NULL,
+          text TEXT NOT NULL DEFAULT '',
+          posted_at TEXT,
+          delivered_at TEXT NOT NULL,
+          telegram_message_id INTEGER,
+          last_checked_at TEXT,
+          next_check_at TEXT NOT NULL,
+          missing_count INTEGER NOT NULL DEFAULT 0,
+          deleted_at TEXT,
+          PRIMARY KEY (username, tweet_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_delivered_tweets_due
+          ON delivered_tweets (deleted_at, next_check_at);
+      `);
+      this.db.pragma('user_version = 2');
     }
   }
 
@@ -280,6 +327,10 @@ export class SqliteStorage implements Storage {
         this.db
           .prepare('UPDATE seen_tweets SET username = ? WHERE username = ?')
           .run(newName, oldName);
+
+        this.db
+          .prepare('UPDATE delivered_tweets SET username = ? WHERE username = ?')
+          .run(newName, oldName);
       })();
       return true;
     } catch (error) {
@@ -340,6 +391,106 @@ export class SqliteStorage implements Storage {
 
   deleteSeenTweets(username: string): void {
     this.db.prepare('DELETE FROM seen_tweets WHERE username = ?').run(username.toLowerCase());
+  }
+
+  trackDeliveredTweets(username: string, tweets: DeliveredTweetInput[]): void {
+    if (!tweets.length) {
+      return;
+    }
+
+    const normalizedUsername = username.toLowerCase();
+    const now = new Date().toISOString();
+    const insert = this.db.prepare(
+      `
+        INSERT OR IGNORE INTO delivered_tweets (
+          username, tweet_id, text, posted_at, delivered_at, telegram_message_id, next_check_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `
+    );
+
+    this.db.transaction(() => {
+      for (const tweet of tweets) {
+        insert.run(
+          normalizedUsername,
+          tweet.tweetId,
+          tweet.text,
+          tweet.postedAt,
+          now,
+          tweet.telegramMessageId,
+          tweet.nextCheckAt
+        );
+      }
+    })();
+  }
+
+  getTrackedTweets(username: string): DeliveredTweet[] {
+    return this.db
+      .prepare('SELECT * FROM delivered_tweets WHERE username = ? AND deleted_at IS NULL')
+      .all(username.toLowerCase())
+      .map(rowToDeliveredTweet);
+  }
+
+  getDueDeletionChecks(now: string, limit: number): DeliveredTweet[] {
+    return this.db
+      .prepare(
+        `
+          SELECT *
+          FROM delivered_tweets
+          WHERE deleted_at IS NULL
+            AND next_check_at <= ?
+          ORDER BY next_check_at, tweet_id
+          LIMIT ?
+        `
+      )
+      .all(now, limit)
+      .map(rowToDeliveredTweet);
+  }
+
+  requestDeletionCheck(username: string, tweetIds: string[], now: string): void {
+    const update = this.db.prepare(
+      `
+        UPDATE delivered_tweets
+        SET next_check_at = ?
+        WHERE username = ? AND tweet_id = ? AND deleted_at IS NULL AND next_check_at > ?
+      `
+    );
+    const normalizedUsername = username.toLowerCase();
+    this.db.transaction(() => {
+      for (const id of tweetIds) {
+        update.run(now, normalizedUsername, id, now);
+      }
+    })();
+  }
+
+  recordDeletionCheck(
+    username: string,
+    tweetId: string,
+    result: { checkedAt: string; missingCount: number; nextCheckAt: string }
+  ): void {
+    this.db
+      .prepare(
+        `
+          UPDATE delivered_tweets
+          SET last_checked_at = ?, missing_count = ?, next_check_at = ?
+          WHERE username = ? AND tweet_id = ?
+        `
+      )
+      .run(result.checkedAt, result.missingCount, result.nextCheckAt, username.toLowerCase(), tweetId);
+  }
+
+  markTweetDeleted(username: string, tweetId: string, deletedAt: string): void {
+    this.db
+      .prepare('UPDATE delivered_tweets SET deleted_at = ?, last_checked_at = ? WHERE username = ? AND tweet_id = ?')
+      .run(deletedAt, deletedAt, username.toLowerCase(), tweetId);
+  }
+
+  pruneDeliveredTweets(cutoff: string): number {
+    return this.db.prepare('DELETE FROM delivered_tweets WHERE delivered_at < ?').run(cutoff).changes;
+  }
+
+  forgetDeliveredTweets(username: string): void {
+    this.db.prepare('DELETE FROM delivered_tweets WHERE username = ?').run(username.toLowerCase());
   }
 
   getRuntimeState(): RuntimeState {

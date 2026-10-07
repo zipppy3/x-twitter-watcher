@@ -1,4 +1,4 @@
-import { SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
+import { DeliveredTweet, SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
 import { escapeHtml } from '../utils/html';
 
 /**
@@ -123,6 +123,46 @@ export function buildThreadMessage(tweets: Tweet[], watchedUsername: string): st
     lines.push(link(watchedUsername, last.id));
     return lines.join('\n');
   });
+}
+
+/** Link to a message in a supergroup (chat ids starting with -100); other chats have no such link. */
+export function telegramMessageLink(chatId: string | null, messageId: number | null): string | null {
+  const match = /^-100(\d+)$/.exec(chatId ?? '');
+  return match && messageId ? `https://t.me/c/${match[1]}/${messageId}` : null;
+}
+
+export function buildTweetDeletedMessage(tweet: DeliveredTweet, noticedAt: string | Date, savedCopyLink: string | null): string {
+  return fit((size) => {
+    const lines = [
+      `🗑 <b>Tweet deleted</b> · <b>@${escapeHtml(tweet.username)}</b>`,
+      '',
+      tweet.text.trim() ? `<blockquote>${preview(tweet.text, size)}</blockquote>` : '<i>(no text)</i>',
+    ];
+    const posted = tweet.postedAt ? formatTimestamp(tweet.postedAt) : null;
+    if (posted) {
+      lines.push(`🕐 Posted: ${posted}`);
+    }
+    const noticed = formatTimestamp(noticedAt);
+    if (noticed) {
+      lines.push(`🔎 Found deleted: ${noticed}`);
+    }
+    if (savedCopyLink) {
+      lines.push(`📌 <a href="${escapeHtml(savedCopyLink)}">Saved copy in this group</a>`);
+    }
+    lines.push(
+      `🔗 <a href="https://x.com/${encodeURIComponent(tweet.username)}/status/${tweet.tweetId}">Former link on X</a>`
+    );
+    return lines.join('\n');
+  });
+}
+
+export function buildAccountUnavailableMessage(username: string): string {
+  return [
+    `⚠️ <b>Account unavailable</b> · <b>@${escapeHtml(username)}</b>`,
+    '',
+    'Its posts can no longer be seen: the account is suspended, deactivated or set to private.',
+    'That is not reported as deleted tweets; the check continues once the account is back.',
+  ].join('\n');
 }
 
 /** Appended when the notification had to be sent without its screenshot or media. */

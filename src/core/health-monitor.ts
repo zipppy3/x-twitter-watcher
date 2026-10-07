@@ -73,7 +73,7 @@ export class HealthMonitor implements HealthReporter {
 
   private readonly sources = new Map<HealthSource, SourceState>();
 
-  private readonly delivered = { tweets: 0, spaces: 0 };
+  private readonly delivered = { tweets: 0, spaces: 0, deleted: 0 };
 
   private timer: NodeJS.Timeout | null = null;
 
@@ -144,7 +144,7 @@ export class HealthMonitor implements HealthReporter {
     this.lastBeatAt = now;
   }
 
-  count(what: 'tweets' | 'spaces'): void {
+  count(what: 'tweets' | 'spaces' | 'deleted'): void {
     this.delivered[what] += 1;
   }
 
@@ -203,6 +203,7 @@ export class HealthMonitor implements HealthReporter {
       }
       this.delivered.tweets = 0;
       this.delivered.spaces = 0;
+      this.delivered.deleted = 0;
     }
   }
 
@@ -221,7 +222,8 @@ export class HealthMonitor implements HealthReporter {
     if (watchlist) {
       lines.push(`Watching: ${escapeHtml(watchlist)}`);
     }
-    lines.push(`Since last report: ${this.delivered.tweets} tweets posted, ${this.delivered.spaces} Spaces recorded`);
+    const deleted = this.delivered.deleted ? `, ${this.delivered.deleted} deleted tweets found` : '';
+    lines.push(`Since last report: ${this.delivered.tweets} tweets posted, ${this.delivered.spaces} Spaces recorded${deleted}`);
 
     for (const [source, state] of this.sources) {
       if (!state.ok && !state.failed) {

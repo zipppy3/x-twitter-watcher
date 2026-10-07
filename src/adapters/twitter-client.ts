@@ -1,7 +1,7 @@
 import path from 'node:path';
 import axios, { AxiosError, AxiosInstance } from 'axios';
 import dotenv from 'dotenv';
-import { AppConfig, HealthReporter, Tweet, TwitterClient } from '../types';
+import { AccountStatus, AppConfig, HealthReporter, Tweet, TweetStatus, TweetStatusSource, TwitterClient } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { refreshTokensFromProfile } from '../utils/refresh-tokens';
 import { ProxyRotator, PlaywrightProxyConfig } from '../utils/proxy-rotator';
@@ -252,6 +252,61 @@ function parseTweetsResponse(data: any, targetUserId?: string): Tweet[] {
   return tweets;
 }
 
+/**
+ * Read a TweetDetail response as "does this tweet still exist?".
+ *
+ * X answers 200 for a deleted (or never existing) id, with the tweet's own entry
+ * present but its `tweet_results` empty. Anything that does not clearly say so is
+ * `unknown`, so a changed response shape cannot be mistaken for a deletion.
+ */
+export function classifyTweetDetail(data: any, tweetId: string): TweetStatus {
+  const instructions = data?.data?.threaded_conversation_with_injections_v2?.instructions;
+  if (!Array.isArray(instructions)) {
+    return 'unknown';
+  }
+
+  for (const instruction of instructions) {
+    for (const entry of instruction.entries || []) {
+      if (entry?.entryId !== `tweet-${tweetId}`) {
+        continue;
+      }
+      const item = entry.content?.itemContent;
+      if (!item || typeof item.tweet_results !== 'object' || item.tweet_results === null) {
+        return 'unknown';
+      }
+      const result = item.tweet_results.result;
+      if (!result) {
+        return 'gone';
+      }
+      if (result.__typename === 'Tweet' || result.__typename === 'TweetWithVisibilityResults') {
+        return 'exists';
+      }
+      if (result.__typename === 'TweetTombstone' || result.__typename === 'TweetUnavailable') {
+        // A tombstone also covers suspended and protected accounts and withheld posts.
+        return /deleted/i.test(result.tombstone?.text?.text || '') ? 'gone' : 'unavailable';
+      }
+      return 'unknown';
+    }
+  }
+
+  return 'unknown';
+}
+
+export function classifyUserByScreenName(data: any): AccountStatus {
+  if (!data?.data || typeof data.data !== 'object') {
+    return 'unknown';
+  }
+  const result = data.data.user?.result;
+  if (!result || result.__typename === 'UserUnavailable') {
+    // No such account any more, or suspended.
+    return 'unavailable';
+  }
+  if (result.legacy?.protected || result.privacy?.protected) {
+    return 'unavailable';
+  }
+  return result.rest_id ? 'visible' : 'unknown';
+}
+
 class QueryResolver {
   private cachedEndpoints: Record<string, string> | null = null;
 
@@ -331,7 +386,7 @@ class QueryResolver {
   }
 }
 
-export class TwitterApiClient implements TwitterClient {
+export class TwitterApiClient implements TwitterClient, TweetStatusSource {
   private readonly logger = rootLogger.child('twitter');
 
   private readonly http: Pick<AxiosInstance, 'get' | 'post'>;
@@ -399,14 +454,7 @@ export class TwitterApiClient implements TwitterClient {
 
   async resolveUserId(username: string): Promise<string | null> {
     try {
-      const queryId = this.resolver.getCachedQueryId('UserByScreenName') || GRAPHQL_ENDPOINTS.UserByScreenName.queryId;
-      const url = `${TWITTER_API_URL}/graphql/${queryId}/UserByScreenName`;
-      const params = cloneParams(GRAPHQL_PARAMS.UserByScreenName, {
-        variables: { screen_name: username },
-      });
-      const { data } = await this.requestWithAuthRetry((proxy) =>
-        this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
-      );
+      const data = await this.fetchUserByScreenName(username);
       return data?.data?.user?.result?.rest_id || null;
     } catch (error) {
       this.logger.error('Failed to resolve user id', { username, message: (error as Error).message });
@@ -520,47 +568,78 @@ export class TwitterApiClient implements TwitterClient {
 
   async getTweetById(tweetId: string): Promise<Tweet | null> {
     try {
-      const queryId = this.resolver.getCachedQueryId('TweetDetail') || GRAPHQL_ENDPOINTS.TweetDetail.queryId;
-      const url = `${TWITTER_API_URL}/graphql/${queryId}/TweetDetail`;
+      return this.parseTweetDetailResponse(await this.fetchTweetDetail(tweetId), tweetId);
+    } catch (error) {
+      this.logger.error('Failed to fetch tweet detail', { tweetId, message: (error as Error).message });
+      return null;
+    }
+  }
+
+  /**
+   * Whether a tweet still exists. Unlike getTweetById, a failed request is kept
+   * apart from a missing tweet: an outage must never look like a deletion.
+   */
+  async getTweetStatus(tweetId: string): Promise<TweetStatus> {
+    try {
+      return classifyTweetDetail(await this.fetchTweetDetail(tweetId), tweetId);
+    } catch (error) {
+      this.logger.warn('Could not check whether a tweet still exists', { tweetId, message: (error as Error).message });
+      return 'unknown';
+    }
+  }
+
+  /** Whether an account's tweets can be seen at all (not suspended, deactivated or protected). */
+  async getAccountStatus(username: string): Promise<AccountStatus> {
+    try {
+      return classifyUserByScreenName(await this.fetchUserByScreenName(username));
+    } catch (error) {
+      this.logger.warn('Could not check whether an account is available', { username, message: (error as Error).message });
+      return 'unknown';
+    }
+  }
+
+  /** Raw TweetDetail response. Retries once with a fresh query id when X rejects the cached one. */
+  private async fetchTweetDetail(tweetId: string): Promise<any> {
+    const request = async (queryId: string): Promise<any> => {
       const params = cloneParams(GRAPHQL_PARAMS.TweetDetail, {
         variables: { focalTweetId: tweetId },
       });
       const { data } = await this.requestWithAuthRetry((proxy) =>
-        this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
+        this.http.get(`${TWITTER_API_URL}/graphql/${queryId}/TweetDetail`, {
+          headers: this.getAuthHeaders(),
+          params,
+          proxy,
+        })
       );
+      return data;
+    };
 
-      return this.parseTweetDetailResponse(data, tweetId);
+    try {
+      return await request(this.resolver.getCachedQueryId('TweetDetail') || GRAPHQL_ENDPOINTS.TweetDetail.queryId);
     } catch (error) {
-      const axiosError = error as AxiosError;
-      const status = axiosError.response?.status;
-      if (status === 404 || status === 422) {
-        this.logger.warn('TweetDetail queryId stale, resolving fresh ID', { tweetId, status });
-        const freshId = await this.resolver.getQueryId('TweetDetail', true);
-        if (freshId) {
-          try {
-            const params = cloneParams(GRAPHQL_PARAMS.TweetDetail, {
-              variables: { focalTweetId: tweetId },
-            });
-            const { data } = await this.requestWithAuthRetry((proxy) =>
-              this.http.get(`${TWITTER_API_URL}/graphql/${freshId}/TweetDetail`, {
-                headers: this.getAuthHeaders(),
-                params,
-                proxy,
-              })
-            );
-            return this.parseTweetDetailResponse(data, tweetId);
-          } catch (retryError) {
-            this.logger.error('Failed to fetch tweet detail with fresh queryId', {
-              tweetId,
-              message: (retryError as Error).message,
-            });
-            return null;
-          }
-        }
+      const status = (error as AxiosError).response?.status;
+      if (status !== 404 && status !== 422) {
+        throw error;
       }
-      this.logger.error('Failed to fetch tweet detail', { tweetId, message: (error as Error).message });
-      return null;
+      this.logger.warn('TweetDetail queryId stale, resolving fresh ID', { tweetId, status });
+      const freshId = await this.resolver.getQueryId('TweetDetail', true);
+      if (!freshId) {
+        throw error;
+      }
+      return request(freshId);
     }
+  }
+
+  private async fetchUserByScreenName(username: string): Promise<any> {
+    const queryId = this.resolver.getCachedQueryId('UserByScreenName') || GRAPHQL_ENDPOINTS.UserByScreenName.queryId;
+    const url = `${TWITTER_API_URL}/graphql/${queryId}/UserByScreenName`;
+    const params = cloneParams(GRAPHQL_PARAMS.UserByScreenName, {
+      variables: { screen_name: username },
+    });
+    const { data } = await this.requestWithAuthRetry((proxy) =>
+      this.http.get(url, { headers: this.getAuthHeaders(), params, proxy })
+    );
+    return data;
   }
 
   private parseTweetDetailResponse(data: any, tweetId: string): Tweet | null {
