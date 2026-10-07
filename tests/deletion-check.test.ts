@@ -469,6 +469,7 @@ describe('tracking posted tweets', () => {
     });
     // The first check is a little later, not at once.
     expect(new Date(tracked[0].nextCheckAt).getTime()).toBeGreaterThan(Date.now() + 10 * MINUTE);
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
   });
 
@@ -477,6 +478,7 @@ describe('tracking posted tweets', () => {
     await worker.pollOnce();
     expect(storage.getSeenTweetIds('alice')).toContain('2');
     expect(storage.getTrackedTweets('alice')).toHaveLength(0);
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
   });
 
@@ -498,6 +500,7 @@ describe('tracking posted tweets', () => {
     timeline = timeline.filter((tweet) => tweet.id !== '13');
     await worker.pollOnce();
     expect(storage.getDueDeletionChecks(new Date().toISOString(), 10).map((tweet) => tweet.tweetId)).toEqual(['13']);
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
   });
 });
