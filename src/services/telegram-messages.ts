@@ -55,6 +55,15 @@ function link(username: string, tweetId: string): string {
   return `🔗 <a href="https://x.com/${encodeURIComponent(username)}/status/${tweetId}">Open on X</a>`;
 }
 
+/**
+ * One tap opens archive.ph's submit page in the reader's own browser. The
+ * address is the x.com/i/ form: archive.ph only saves a whole thread from that one.
+ */
+function archiveLink(tweetId: string): string {
+  const target = encodeURIComponent(`https://x.com/i/status/${tweetId}`);
+  return `🗄 <a href="https://archive.ph/?run=1&amp;url=${target}">Save to archive.ph</a>`;
+}
+
 /** Try progressively shorter previews until the message fits a caption. */
 function fit(build: (size: number) => string): string {
   let message = '';
@@ -97,7 +106,7 @@ export function buildTweetMessage(tweet: Tweet, watchedUsername: string): string
     if (time) {
       lines.push(`🕐 ${time}`);
     }
-    lines.push(link(watchedUsername, tweet.id));
+    lines.push(link(watchedUsername, tweet.id), archiveLink(tweet.id));
     return lines.join('\n');
   });
 }
@@ -120,7 +129,7 @@ export function buildThreadMessage(tweets: Tweet[], watchedUsername: string): st
     if (time) {
       lines.push(`🕐 ${time}`);
     }
-    lines.push(link(watchedUsername, last.id));
+    lines.push(link(watchedUsername, last.id), archiveLink(last.id));
     return lines.join('\n');
   });
 }

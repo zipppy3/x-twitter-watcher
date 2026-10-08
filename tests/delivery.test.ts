@@ -185,6 +185,12 @@ describe('telegram messages', () => {
     expect(message).toContain('📎 2 photos');
     expect(message).toContain('🕐 5 Oct 2026, 20:51 UTC');
     expect(message).toContain('<a href="https://x.com/alice/status/12">Open on X</a>');
+    expect(message).toContain('<a href="https://archive.ph/?run=1&amp;url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F12">Save to archive.ph</a>');
+  });
+
+  test('a thread is archived from its last tweet, so the whole thread is on the page', () => {
+    const thread = buildThreadMessage([makeTweet('1', 'first'), makeTweet('2', 'second'), makeTweet('3', 'third')], 'alice');
+    expect(thread).toContain('url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F3">Save to archive.ph</a>');
   });
 
   test('never exceeds the caption limit, even when escaping inflates the text', () => {
@@ -194,10 +200,11 @@ describe('telegram messages', () => {
       'alice'
     );
     expect(message.length).toBeLessThanOrEqual(1000);
-    expect(message).toContain('Open on X'); // the end of the message survived
+    expect(message).toContain('Save to archive.ph</a>'); // the end of the message survived
 
     const thread = buildThreadMessage([makeTweet('1', noisy), makeTweet('2', noisy)], 'alice');
     expect(thread.length).toBeLessThanOrEqual(1000);
+    expect(thread).toContain('Save to archive.ph</a>');
     expect(thread).toContain('🧵 <b>New thread</b>');
   });
 });
