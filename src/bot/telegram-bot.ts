@@ -4,6 +4,8 @@ import { rootLogger } from '../runtime/logger';
 import { deleteUserDownloads, DeleteTarget } from '../services/download-manager';
 import { WatchlistService, normalizeUsername } from '../services/watchlist-service';
 import { escapeHtml } from '../utils/html';
+import { ScreenshotRetryService } from '../services/screenshot-retry';
+import { buildFailedScreenshotList } from '../services/telegram-messages';
 
 function parseAddMode(args: string[]): { mode: 'all' | 'spaces' | 'tweets'; watchReplies: boolean } {
   const flags = args.map((arg) => arg.toLowerCase());
@@ -29,7 +31,8 @@ export class TelegramControlBot {
   constructor(
     private readonly config: AppConfig,
     private readonly watchlistService: WatchlistService,
-    private readonly statusProvider: () => WatcherStatus
+    private readonly statusProvider: () => WatcherStatus,
+    private readonly screenshotRetry?: ScreenshotRetryService
   ) {}
 
   async start(): Promise<void> {
@@ -79,6 +82,9 @@ export class TelegramControlBot {
             break;
           case '/delete':
             await this.handleDelete(reply, args);
+            break;
+          case '/retry':
+            await this.handleRetry(reply, args, message.reply_to_message?.message_id);
             break;
           case '/help':
           case '/start':
@@ -235,6 +241,68 @@ export class TelegramControlBot {
     );
   }
 
+  private async handleRetry(reply: Reply, args: string[], repliedTo?: number): Promise<void> {
+    const retry = this.screenshotRetry;
+    if (!retry) {
+      await reply('ℹ️ Screenshot retry is not available.');
+      return;
+    }
+
+    let postIds: string[] | null;
+    if (args.length === 1 && args[0].toLowerCase() === 'all') {
+      postIds = null;
+    } else if (args.length) {
+      const ids = args.map((arg) => arg.match(/(\d{5,})/)?.[1]).filter((id): id is string => Boolean(id));
+      if (!ids.length) {
+        await reply('ℹ️ <b>Usage:</b> <code>/retry</code> (list) · <code>/retry tweet-id-or-link</code> · <code>/retry all</code>');
+        return;
+      }
+      postIds = ids.flatMap((id) => retry.find({ postId: id }));
+      if (!postIds.length) {
+        await reply('ℹ️ No failed screenshot is waiting for that tweet. <code>/retry</code> lists the ones that are.');
+        return;
+      }
+    } else {
+      const replied = repliedTo ? retry.find({ messageId: repliedTo }) : [];
+      if (!replied.length) {
+        await reply(buildFailedScreenshotList(retry.pending()));
+        return;
+      }
+      postIds = replied;
+    }
+
+    const count = new Set(postIds ?? retry.pending().map((item) => item.postId)).size;
+    if (!count) {
+      await reply(buildFailedScreenshotList([]));
+      return;
+    }
+    if (retry.isBusy) {
+      await reply('⏳ A retry is already running. Try again when it has finished.');
+      return;
+    }
+
+    await reply(`⏳ Retrying ${count} post${count === 1 ? '' : 's'}… the screenshots follow as replies to the posts.`);
+
+    // Several screenshots can take minutes; the chat should not wait on this handler.
+    void retry
+      .retry(postIds)
+      .then(async (outcomes) => {
+        if (!outcomes) {
+          return;
+        }
+        const failed = outcomes.filter((outcome) => !outcome.ok);
+        const lines = [`📸 <b>Retry finished</b>: ${outcomes.length - failed.length} of ${outcomes.length} done`];
+        for (const outcome of failed) {
+          lines.push(`❌ @${escapeHtml(outcome.username)} · <code>/retry ${outcome.postId}</code>`);
+        }
+        await reply(lines.join('\n'));
+      })
+      .catch((error) => {
+        this.logger.warn('Screenshot retry failed', { message: (error as Error).message });
+        return reply(`⚠️ ${escapeHtml((error as Error).message)}`).catch(() => undefined);
+      });
+  }
+
   private async handleHelp(reply: Reply): Promise<void> {
     await reply(
       `❓ <b>X Watcher commands</b>\n\n` +
@@ -252,7 +320,13 @@ export class TelegramControlBot {
         `/config username — show settings\n` +
         `/config username media|screenshots|metadata|all on|off\n\n` +
         `<b>🗑 Delete downloaded files</b>\n` +
-        `/delete username tweets|spaces|all`
+        `/delete username tweets|spaces|all\n\n` +
+        `<b>📸 Failed screenshots</b>\n` +
+        `/retry — list posts whose screenshot failed\n` +
+        `/retry tweet-id-or-link — try that one again\n` +
+        `/retry id1 id2 … — a few at once\n` +
+        `/retry all — every one that is waiting\n` +
+        `Or reply to a failure notice with /retry`
     );
   }
 

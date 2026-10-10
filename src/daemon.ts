@@ -12,6 +12,7 @@ import { TweetMonitorWorker } from './core/tweet-monitor-worker';
 import { SpaceMonitorWorker } from './core/space-monitor-worker';
 import { DeletionCheckWorker } from './core/deletion-check-worker';
 import { TelegramControlBot } from './bot/telegram-bot';
+import { ScreenshotRetryService } from './services/screenshot-retry';
 import { WatcherSupervisor } from './core/supervisor';
 import { HealthMonitor } from './core/health-monitor';
 import {
@@ -23,6 +24,7 @@ import {
   writePidFile,
 } from './runtime/pid-file';
 import { closeFileLogging, enableFileLogging, rootLogger } from './runtime/logger';
+import { buildFailedScreenshotList } from './services/telegram-messages';
 import { createProxyRotator } from './utils/proxy-rotator';
 
 export interface DaemonOptions {
@@ -63,6 +65,10 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
       const spaces = targets.filter((target) => target.watchSpaces).length;
       return `${tweets.length} tweet accounts (${replies} with replies), ${spaces} Spaces`;
     },
+    describePending: () => {
+      const pending = screenshotRetry.pending();
+      return pending.length ? buildFailedScreenshotList(pending) : null;
+    },
     onProblemChange: (problem) => {
       storage.updateRuntimeState({ lastError: problem });
     },
@@ -87,13 +93,14 @@ export async function runDaemon(options: DaemonOptions = {}): Promise<void> {
   const tweetWorkerClient = nitterClient || twitterClient;
   const screenshotService = new CamoufoxScreenshotService(config, camoufox, proxyRotator, nitterClient ?? undefined, health);
   const spacesProvider = new TwspaceSpacesProvider(config, (reason) => twitterClient.refreshAuth(reason), health);
-  const tweetWorker = new TweetMonitorWorker(config, storage, tweetWorkerClient, telegramClient, screenshotService, health);
+  const screenshotRetry = new ScreenshotRetryService(config, storage, telegramClient, screenshotService);
+  const tweetWorker = new TweetMonitorWorker(config, storage, tweetWorkerClient, telegramClient, screenshotService, health, screenshotRetry);
   const spaceWorker = new SpaceMonitorWorker(config, storage, spacesProvider, telegramClient, health);
   // Tweet ids from Nitter are the same ids, but only the X API can say whether one still exists.
   const deletionWorker =
     config.dataSource === 'nitter' ? undefined : new DeletionCheckWorker(config, storage, twitterClient, telegramClient, health);
   let supervisor: WatcherSupervisor;
-  const controlBot = new TelegramControlBot(config, watchlistService, () => supervisor.getStatus());
+  const controlBot = new TelegramControlBot(config, watchlistService, () => supervisor.getStatus(), screenshotRetry);
 
   supervisor = new WatcherSupervisor(
     config,

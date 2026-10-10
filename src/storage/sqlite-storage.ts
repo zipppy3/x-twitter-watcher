@@ -3,8 +3,11 @@ import {
   ActiveSpace,
   DeliveredTweet,
   DeliveredTweetInput,
+  FailedScreenshot,
+  FailedScreenshotInput,
   RecordingRecord,
   RuntimeState,
+  ScreenshotKind,
   Storage,
   WatchTarget,
   WatchTargetInput,
@@ -57,6 +60,23 @@ function rowToDeliveredTweet(row: any): DeliveredTweet {
     nextCheckAt: row.next_check_at,
     missingCount: row.missing_count,
     deletedAt: row.deleted_at,
+  };
+}
+
+function rowToFailedScreenshot(row: any): FailedScreenshot {
+  return {
+    postId: row.post_id,
+    kind: row.kind,
+    username: row.username,
+    captureUsername: row.capture_username,
+    captureTweetId: row.capture_tweet_id,
+    isReply: Boolean(row.is_reply),
+    outputPath: row.output_path,
+    telegramMessageId: row.telegram_message_id,
+    noticeMessageId: row.notice_message_id,
+    topicId: row.topic_id,
+    failedAt: row.failed_at,
+    attempts: row.attempts,
   };
 }
 
@@ -201,6 +221,28 @@ export class SqliteStorage implements Storage {
           ON delivered_tweets (deleted_at, next_check_at);
       `);
       this.db.pragma('user_version = 2');
+    }
+
+    if ((this.db.pragma('user_version', { simple: true }) as number) < 3) {
+      // Posts delivered without their screenshot, kept so /retry can take it again.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS failed_screenshots (
+          post_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          username TEXT NOT NULL,
+          capture_username TEXT NOT NULL,
+          capture_tweet_id TEXT NOT NULL,
+          is_reply INTEGER NOT NULL DEFAULT 0,
+          output_path TEXT NOT NULL,
+          telegram_message_id INTEGER,
+          notice_message_id INTEGER,
+          topic_id TEXT,
+          failed_at TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (post_id, kind)
+        );
+      `);
+      this.db.pragma('user_version = 3');
     }
   }
 
@@ -491,6 +533,65 @@ export class SqliteStorage implements Storage {
 
   forgetDeliveredTweets(username: string): void {
     this.db.prepare('DELETE FROM delivered_tweets WHERE username = ?').run(username.toLowerCase());
+  }
+
+  recordFailedScreenshots(items: FailedScreenshotInput[]): void {
+    if (!items.length) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const insert = this.db.prepare(
+      `
+        INSERT INTO failed_screenshots (
+          post_id, kind, username, capture_username, capture_tweet_id, is_reply,
+          output_path, telegram_message_id, topic_id, failed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(post_id, kind) DO NOTHING
+      `
+    );
+    this.db.transaction(() => {
+      for (const item of items) {
+        insert.run(
+          item.postId,
+          item.kind,
+          item.username.toLowerCase(),
+          item.captureUsername,
+          item.captureTweetId,
+          Number(item.isReply),
+          item.outputPath,
+          item.telegramMessageId,
+          item.topicId,
+          now
+        );
+      }
+    })();
+  }
+
+  setFailedScreenshotNotice(postId: string, noticeMessageId: number): void {
+    this.db.prepare('UPDATE failed_screenshots SET notice_message_id = ? WHERE post_id = ?').run(noticeMessageId, postId);
+  }
+
+  getFailedScreenshots(): FailedScreenshot[] {
+    return this.db
+      .prepare('SELECT * FROM failed_screenshots ORDER BY failed_at, post_id, kind')
+      .all()
+      .map(rowToFailedScreenshot);
+  }
+
+  noteFailedScreenshotAttempt(postId: string, kind: ScreenshotKind): void {
+    this.db
+      .prepare('UPDATE failed_screenshots SET attempts = attempts + 1 WHERE post_id = ? AND kind = ?')
+      .run(postId, kind);
+  }
+
+  removeFailedScreenshot(postId: string, kind: ScreenshotKind): void {
+    this.db.prepare('DELETE FROM failed_screenshots WHERE post_id = ? AND kind = ?').run(postId, kind);
+  }
+
+  pruneFailedScreenshots(cutoff: string): number {
+    return this.db.prepare('DELETE FROM failed_screenshots WHERE failed_at < ?').run(cutoff).changes;
   }
 
   getRuntimeState(): RuntimeState {

@@ -45,13 +45,18 @@ export class TelegramBotApiClient implements TelegramClient {
     return Boolean(this.config.telegramBotToken && this.config.telegramChatId);
   }
 
-  async sendMessage(message: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean> {
+  async sendMessage(
+    message: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt,
+    replyToMessageId?: number | null
+  ): Promise<boolean> {
     if (!this.isConfigured()) {
       return false;
     }
 
     const send = (thread: string | null): Promise<boolean> => {
-      const payload: Record<string, string | boolean> = {
+      const payload: Record<string, string | number | boolean> = {
         chat_id: this.config.telegramChatId!,
         text: message,
         parse_mode: 'HTML',
@@ -59,6 +64,10 @@ export class TelegramBotApiClient implements TelegramClient {
       };
       if (thread) {
         payload.message_thread_id = thread;
+      }
+      if (replyToMessageId) {
+        payload.reply_to_message_id = replyToMessageId;
+        payload.allow_sending_without_reply = true;
       }
       return this.requestWithFallback(
         (baseUrl) =>
@@ -112,12 +121,14 @@ export class TelegramBotApiClient implements TelegramClient {
     filePath: string,
     caption?: string,
     threadId?: string | null,
-    receipt?: TelegramReceipt
+    receipt?: TelegramReceipt,
+    replyToMessageId?: number | null
   ): Promise<boolean> {
     return this.uploadFile('sendPhoto', 'photo', filePath, {
       caption,
       threadId,
       receipt,
+      replyToMessageId,
       timeout: 30000,
     });
   }
@@ -254,6 +265,7 @@ export class TelegramBotApiClient implements TelegramClient {
       caption?: string;
       threadId?: string | null;
       receipt?: TelegramReceipt;
+      replyToMessageId?: number | null;
       timeout: number;
       extraFields?: Record<string, string>;
       onFallbackFailure?: (error: AxiosError) => Promise<void>;
@@ -270,6 +282,11 @@ export class TelegramBotApiClient implements TelegramClient {
       const safe = safeThreadId(options.threadId);
       if (safe) {
         form.append('message_thread_id', safe);
+      }
+
+      if (options.replyToMessageId) {
+        form.append('reply_to_message_id', String(options.replyToMessageId));
+        form.append('allow_sending_without_reply', 'true');
       }
 
       form.append(fieldName, fs.createReadStream(filePath));

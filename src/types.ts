@@ -215,6 +215,31 @@ export interface DeliveredTweetInput {
   nextCheckAt: string;
 }
 
+/** What was being captured when a screenshot failed. */
+export type ScreenshotKind = 'tweet' | 'thread' | 'parent';
+
+/** A screenshot that could not be taken for a post that was delivered without it. */
+export interface FailedScreenshot {
+  /** The tweet the notification was about (the first tweet of a thread); what `/retry` takes. */
+  postId: string;
+  kind: ScreenshotKind;
+  /** The watched account the post was delivered for. */
+  username: string;
+  captureUsername: string;
+  captureTweetId: string;
+  isReply: boolean;
+  outputPath: string;
+  /** The Telegram message the post went out as, so the retry can answer it. */
+  telegramMessageId: number | null;
+  /** The "screenshot failed" notice, so `/retry` also works as a reply to it. */
+  noticeMessageId: number | null;
+  topicId: string | null;
+  failedAt: string;
+  attempts: number;
+}
+
+export type FailedScreenshotInput = Omit<FailedScreenshot, 'failedAt' | 'attempts' | 'noticeMessageId'>;
+
 /**
  * `gone`: X answered and has no such tweet. `unavailable`: X hides it for another
  * reason (suspended or protected account, withheld). `unknown`: the request failed
@@ -285,6 +310,14 @@ export interface Storage {
   /** Forget tracked tweets delivered before `cutoff`; returns how many were dropped. */
   pruneDeliveredTweets(cutoff: string): number;
   forgetDeliveredTweets(username: string): void;
+  /** Remember screenshots that failed; a post that is already listed keeps its first failure time. */
+  recordFailedScreenshots(items: FailedScreenshotInput[]): void;
+  setFailedScreenshotNotice(postId: string, noticeMessageId: number): void;
+  getFailedScreenshots(): FailedScreenshot[];
+  noteFailedScreenshotAttempt(postId: string, kind: ScreenshotKind): void;
+  removeFailedScreenshot(postId: string, kind: ScreenshotKind): void;
+  /** Forget failures from before `cutoff`; returns how many were dropped. */
+  pruneFailedScreenshots(cutoff: string): number;
   getRuntimeState(): RuntimeState;
   updateRuntimeState(patch: Partial<RuntimeState>): RuntimeState;
   setActiveSpaces(activeSpaces: ActiveSpace[]): RuntimeState;
@@ -307,8 +340,19 @@ export interface TwitterClient {
 
 export interface TelegramClient {
   isConfigured(): boolean;
-  sendMessage(message: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
-  sendPhoto(filePath: string, caption?: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
+  sendMessage(
+    message: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt,
+    replyToMessageId?: number | null
+  ): Promise<boolean>;
+  sendPhoto(
+    filePath: string,
+    caption?: string,
+    threadId?: string | null,
+    receipt?: TelegramReceipt,
+    replyToMessageId?: number | null
+  ): Promise<boolean>;
   sendVideo(filePath: string, caption?: string, threadId?: string | null, receipt?: TelegramReceipt): Promise<boolean>;
   sendDocument(filePath: string, threadId?: string | null): Promise<boolean>;
   sendAudio(

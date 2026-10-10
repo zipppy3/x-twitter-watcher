@@ -42,6 +42,8 @@ export interface HealthMonitorOptions {
   dailyReportHour: number | null;
   notify: (html: string) => Promise<unknown>;
   describeWatchlist?: () => string;
+  /** Extra HTML for the daily report (e.g. screenshots waiting for a retry); null or empty = nothing to add. */
+  describePending?: () => string | null;
   /** Called with the current problem summary, or null once everything is healthy again. */
   onProblemChange?: (problem: string | null) => void;
   now?: () => Date;
@@ -236,6 +238,15 @@ export class HealthMonitor implements HealthReporter {
     const problems = this.problems();
     if (problems.length) {
       lines.push('', `⚠ Open problems: ${problems.join(', ')}`);
+    }
+
+    try {
+      const pending = this.options.describePending?.();
+      if (pending) {
+        lines.push('', pending);
+      }
+    } catch (error) {
+      this.logger.warn('Could not list pending items for the report', { message: (error as Error).message });
     }
     return lines.join('\n');
   }

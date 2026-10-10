@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import axios from 'axios';
-import { AppConfig, HealthReporter, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, TelegramReceipt, Tweet, TwitterClient, WatchTarget } from '../types';
+import { AppConfig, FailedScreenshotInput, HealthReporter, ScreenshotService, Storage, TelegramClient, TelegramMediaItem, TelegramReceipt, Tweet, TwitterClient, WatchTarget } from '../types';
 import { FIRST_DELETION_CHECK_DELAY_MS, MIN_RECHECK_GAP_MS } from './deletion-check-worker';
 import { rootLogger } from '../runtime/logger';
 import { ensureFileDir, sanitizeFilename } from '../utils/files';
 import { sleep, randomSleep } from '../utils/async';
 import { getTopicId } from '../services/topic-routing';
+import { ScreenshotRetryService } from '../services/screenshot-retry';
 import { buildThreadMessage, buildTweetMessage, MEDIA_MISSING_NOTE } from '../services/telegram-messages';
 
 function getTimestamp(dateStr: string): string {
@@ -53,7 +54,8 @@ export class TweetMonitorWorker {
     private readonly twitterClient: TwitterClient,
     private readonly telegramClient: TelegramClient,
     private readonly screenshotService: ScreenshotService,
-    private readonly health?: HealthReporter
+    private readonly health?: HealthReporter,
+    private readonly screenshotRetry?: ScreenshotRetryService
   ) {}
 
   async start(): Promise<void> {
@@ -561,6 +563,8 @@ export class TweetMonitorWorker {
     const media = target.saveMedia ? await this.downloadTweetMedia(tweet, baseDir, baseName) : [];
 
     // Capture screenshot (if enabled)
+    const failedScreenshots: FailedScreenshotInput[] = [];
+    const topicId = getTopicId(this.config, target, 'tweet');
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
       const screenshotPath = path.join(baseDir, 'screenshots', `${baseName}.jpg`);
@@ -584,13 +588,26 @@ export class TweetMonitorWorker {
           screenshotResult = screenshotPath;
         }
       }
+
+      if (!screenshotResult) {
+        failedScreenshots.push({
+          postId: tweet.id,
+          kind: 'tweet',
+          username: target.username,
+          captureUsername: target.username,
+          captureTweetId: tweet.id,
+          isReply: isReplyByWatchedUser,
+          outputPath: screenshotPath,
+          telegramMessageId: null,
+          topicId,
+        });
+      }
     }
 
     const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username?.toLowerCase() === target.username);
 
     const message = buildTweetMessage(tweet, target.username);
 
-    const topicId = getTopicId(this.config, target, 'tweet');
     // When isReplyByWatchedUser is true, the main screenshot already includes the
     // full conversation (parent tweets + reply), so skip the separate parent screenshot.
     let parentScreenshotResult: string | null = null;
@@ -604,6 +621,19 @@ export class TweetMonitorWorker {
       if (!parentScreenshotResult && fs.existsSync(parentScreenshotPath)) {
         const stat = fs.statSync(parentScreenshotPath);
         if (stat.size > 0) parentScreenshotResult = parentScreenshotPath;
+      }
+      if (!parentScreenshotResult) {
+        failedScreenshots.push({
+          postId: tweet.id,
+          kind: 'parent',
+          username: target.username,
+          captureUsername: tweet.inReplyToTweet.author.username || target.username,
+          captureTweetId: tweet.inReplyToTweet.id,
+          isReply: false,
+          outputPath: parentScreenshotPath,
+          telegramMessageId: null,
+          topicId,
+        });
       }
     }
 
@@ -630,6 +660,7 @@ export class TweetMonitorWorker {
       return false;
     }
     this.trackDelivered([tweet], target, messageId);
+    await this.reportFailedScreenshots(failedScreenshots, messageId, topicId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];
@@ -676,6 +707,8 @@ export class TweetMonitorWorker {
       }
     }
 
+    const failedScreenshots: FailedScreenshotInput[] = [];
+    const topicId = getTopicId(this.config, target, 'tweet');
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
       const lastTweet = tweets[tweets.length - 1];
@@ -689,6 +722,20 @@ export class TweetMonitorWorker {
           this.logger.info('Thread screenshot timed out but file exists on disk, using it', { screenshotPath, size: stat.size });
           screenshotResult = screenshotPath;
         }
+      }
+
+      if (!screenshotResult) {
+        failedScreenshots.push({
+          postId: tweets[0].id,
+          kind: 'thread',
+          username: target.username,
+          captureUsername: target.username,
+          captureTweetId: lastTweet.id,
+          isReply: false,
+          outputPath: screenshotPath,
+          telegramMessageId: null,
+          topicId,
+        });
       }
     }
 
@@ -704,6 +751,19 @@ export class TweetMonitorWorker {
         const stat = fs.statSync(parentScreenshotPath);
         if (stat.size > 0) parentScreenshotResult = parentScreenshotPath;
       }
+      if (!parentScreenshotResult) {
+        failedScreenshots.push({
+          postId: tweets[0].id,
+          kind: 'parent',
+          username: target.username,
+          captureUsername: tweets[0].inReplyToTweet.author.username || target.username,
+          captureTweetId: tweets[0].inReplyToTweet.id,
+          isReply: false,
+          outputPath: parentScreenshotPath,
+          telegramMessageId: null,
+          topicId,
+        });
+      }
     }
 
     if (parentScreenshotResult) {
@@ -718,12 +778,12 @@ export class TweetMonitorWorker {
 
     const message = buildThreadMessage(tweets, target.username);
 
-    const topicId = getTopicId(this.config, target, 'tweet');
     const { delivered, mediaSent, messageId } = await this.sendNotification(mediaItems, message, topicId);
     if (!delivered) {
       return false;
     }
     this.trackDelivered(tweets, target, messageId);
+    await this.reportFailedScreenshots(failedScreenshots, messageId, topicId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];
@@ -738,6 +798,21 @@ export class TweetMonitorWorker {
     this.autoDeleteFiles(uploaded, true);
     this.health?.count('tweets');
     return true;
+  }
+
+  /** Remember screenshots that are missing from a delivered post and tell the chat which post it was. */
+  private async reportFailedScreenshots(
+    failed: FailedScreenshotInput[],
+    messageId: number | undefined,
+    topicId: string | null
+  ): Promise<void> {
+    if (!failed.length || !this.screenshotRetry || !this.telegramClient.isConfigured()) {
+      return;
+    }
+    await this.screenshotRetry.report(
+      failed.map((item) => ({ ...item, telegramMessageId: messageId ?? null })),
+      topicId
+    );
   }
 
   /**

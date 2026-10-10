@@ -1,4 +1,4 @@
-import { DeliveredTweet, SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
+import { DeliveredTweet, FailedScreenshot, SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
 import { escapeHtml } from '../utils/html';
 
 /**
@@ -225,4 +225,45 @@ export function buildStartedMessage(mode: string, spaces: number, tweets: number
 
 export function buildStoppedMessage(crashed: boolean, reason: string): string {
   return `${crashed ? '🔴 <b>X Watcher crashed</b>' : '🟡 <b>X Watcher stopped</b>'}\n\nReason: ${escapeHtml(reason)}`;
+}
+
+function postLink(username: string, postId: string): string {
+  return `<a href="https://x.com/${encodeURIComponent(username)}/status/${postId}">@${escapeHtml(username)}</a>`;
+}
+
+/** Posts whose screenshots failed, oldest first, with their images folded together. */
+export function groupFailedByPost(failed: FailedScreenshot[]): Array<{ postId: string; username: string; failedAt: string; count: number }> {
+  const posts = new Map<string, { postId: string; username: string; failedAt: string; count: number }>();
+  for (const item of failed) {
+    const post = posts.get(item.postId);
+    if (post) {
+      post.count += 1;
+    } else {
+      posts.set(item.postId, { postId: item.postId, username: item.username, failedAt: item.failedAt, count: 1 });
+    }
+  }
+  return [...posts.values()];
+}
+
+/** Sent as a reply to the post that went out without its screenshot. */
+export function buildScreenshotFailedMessage(failed: FailedScreenshot[]): string {
+  const [post] = groupFailedByPost(failed);
+  const what = post.count > 1 ? `${post.count} screenshots` : 'The screenshot';
+  return [
+    `📸 <b>${what} could not be taken</b> · ${postLink(post.username, post.postId)}`,
+    `Try again: <code>/retry ${post.postId}</code> (or reply to this message with /retry)`,
+  ].join('\n');
+}
+
+/** For /retry without arguments and for the daily health report. */
+export function buildFailedScreenshotList(failed: FailedScreenshot[]): string {
+  const posts = groupFailedByPost(failed);
+  if (!posts.length) {
+    return '✅ No screenshots are waiting for a retry.';
+  }
+  const lines = posts.map((post) => {
+    const when = formatTimestamp(post.failedAt);
+    return `• ${postLink(post.username, post.postId)}${when ? ` · ${when}` : ''}\n   <code>/retry ${post.postId}</code>`;
+  });
+  return [`📸 <b>Screenshots to retry (${posts.length})</b>`, '', ...lines, '', '<code>/retry all</code> tries every one of them.'].join('\n');
 }
