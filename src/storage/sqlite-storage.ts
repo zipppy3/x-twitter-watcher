@@ -590,6 +590,12 @@ export class SqliteStorage implements Storage {
     this.db.prepare('DELETE FROM failed_screenshots WHERE post_id = ? AND kind = ?').run(postId, kind);
   }
 
+  removeFailedScreenshotsOfTweet(tweetId: string): number {
+    return this.db
+      .prepare('DELETE FROM failed_screenshots WHERE post_id = ? OR capture_tweet_id = ?')
+      .run(tweetId, tweetId).changes;
+  }
+
   pruneFailedScreenshots(cutoff: string): number {
     return this.db.prepare('DELETE FROM failed_screenshots WHERE failed_at < ?').run(cutoff).changes;
   }

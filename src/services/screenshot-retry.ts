@@ -113,6 +113,7 @@ export class ScreenshotRetryService {
   }
 
   private async retryOne(item: FailedScreenshot): Promise<boolean> {
+    this.logger.info('Retrying screenshot', { postId: item.postId, kind: item.kind, attempt: item.attempts + 1 });
     try {
       const path =
         item.kind === 'thread'
@@ -137,6 +138,7 @@ export class ScreenshotRetryService {
       return true;
     } catch (error) {
       this.logger.warn('Screenshot retry failed', { postId: item.postId, message: (error as Error).message });
+      this.storage.noteFailedScreenshotAttempt(item.postId, item.kind);
       return false;
     }
   }

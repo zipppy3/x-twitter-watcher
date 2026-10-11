@@ -316,6 +316,8 @@ export interface Storage {
   getFailedScreenshots(): FailedScreenshot[];
   noteFailedScreenshotAttempt(postId: string, kind: ScreenshotKind): void;
   removeFailedScreenshot(postId: string, kind: ScreenshotKind): void;
+  /** Forget what was waiting for a tweet that no longer exists; returns how many were dropped. */
+  removeFailedScreenshotsOfTweet(tweetId: string): number;
   /** Forget failures from before `cutoff`; returns how many were dropped. */
   pruneFailedScreenshots(cutoff: string): number;
   getRuntimeState(): RuntimeState;

@@ -40,7 +40,9 @@ export class TelegramControlBot {
       return;
     }
 
-    const bot = new Bot(this.config.telegramBotToken);
+    // Same server as the sending side: a bot that is logged in to a local Bot API
+    // server gets its updates there, and the cloud API then has none to hand out.
+    const bot = new Bot(this.config.telegramBotToken, { apiRoot: this.config.telegramApiUrl });
     this.bot = bot;
 
     bot.on('message', async (ctx) => {
@@ -63,6 +65,8 @@ export class TelegramControlBot {
       };
 
       const [command, ...args] = text.split(/\s+/);
+      // Without this line a bot that hears nothing looks the same as one nobody talked to.
+      this.logger.info('Command received', { command, args: args.length });
       try {
         switch (command.toLowerCase().split('@')[0]) {
           case '/add':

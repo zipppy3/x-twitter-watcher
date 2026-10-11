@@ -195,6 +195,18 @@ describe('failed screenshots', () => {
     storage.close();
   });
 
+  test('a retry that blows up still counts as an attempt and leaves the post listed', async () => {
+    const { storage, screenshots, retry } = setup();
+    storage.recordFailedScreenshots([failure('222222')]);
+    screenshots.captureTweet = async () => {
+      throw new Error('browser gone');
+    };
+
+    expect(await retry.retry(['222222'])).toEqual([{ postId: '222222', username: 'alice', ok: false, remaining: 1 }]);
+    expect(storage.getFailedScreenshots()).toMatchObject([{ postId: '222222', attempts: 2 }]);
+    storage.close();
+  });
+
   test('a batch retries every pending post, and a post can be found from the messages around it', async () => {
     const { storage, screenshots, retry } = setup();
     storage.recordFailedScreenshots([

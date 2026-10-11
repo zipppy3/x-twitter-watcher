@@ -214,6 +214,19 @@ describe('deletion check', () => {
     track('100', 'Tom & Jerry <3');
     track('101');
     source.tweets.set('100', 'gone');
+    storage.recordFailedScreenshots(
+      ['100', '101'].map((postId) => ({
+        postId,
+        kind: 'tweet' as const,
+        username: 'alice',
+        captureUsername: 'alice',
+        captureTweetId: postId,
+        isReply: false,
+        outputPath: `${postId}.jpg`,
+        telegramMessageId: 321,
+        topicId: null,
+      }))
+    );
 
     await worker.runOnce(now);
     expect(telegram.sent).toHaveLength(0); // one "gone" is not enough
@@ -235,6 +248,8 @@ describe('deletion check', () => {
 
     // Reported tweets are done; the other one is still tracked.
     expect(storage.getTrackedTweets('alice').map((tweet) => tweet.tweetId)).toEqual(['101']);
+    // A screenshot that was waiting for the deleted tweet is no longer offered for /retry.
+    expect(storage.getFailedScreenshots().map((item) => item.postId)).toEqual(['101']);
     advance(3 * DAY);
     await worker.runOnce(now);
     expect(telegram.sent).toHaveLength(1);

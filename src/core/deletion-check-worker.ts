@@ -171,6 +171,8 @@ export class DeletionCheckWorker {
       this.unavailableAccounts.delete(tweet.username);
       if (await this.reportDeleted(tweet, checkedAt)) {
         this.storage.markTweetDeleted(tweet.username, tweet.tweetId, new Date(checkedAt).toISOString());
+        // Its screenshot can never be taken now, so it should not stay listed for /retry.
+        this.storage.removeFailedScreenshotsOfTweet(tweet.tweetId);
         this.health?.count('deleted');
       } else {
         // Telegram did not take the notice. The tweet stays due, so it is announced
