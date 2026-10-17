@@ -564,6 +564,8 @@ export class TweetMonitorWorker {
 
     // Capture screenshot (if enabled)
     const failedScreenshots: FailedScreenshotInput[] = [];
+    // Taken but not yet sent: these join the retry list if the upload fails.
+    const takenScreenshots: FailedScreenshotInput[] = [];
     const topicId = getTopicId(this.config, target, 'tweet');
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
@@ -589,19 +591,17 @@ export class TweetMonitorWorker {
         }
       }
 
-      if (!screenshotResult) {
-        failedScreenshots.push({
-          postId: tweet.id,
-          kind: 'tweet',
-          username: target.username,
-          captureUsername: target.username,
-          captureTweetId: tweet.id,
-          isReply: isReplyByWatchedUser,
-          outputPath: screenshotPath,
-          telegramMessageId: null,
-          topicId,
-        });
-      }
+      (screenshotResult ? takenScreenshots : failedScreenshots).push({
+        postId: tweet.id,
+        kind: 'tweet',
+        username: target.username,
+        captureUsername: target.username,
+        captureTweetId: tweet.id,
+        isReply: isReplyByWatchedUser,
+        outputPath: screenshotPath,
+        telegramMessageId: null,
+        topicId,
+      });
     }
 
     const isReplyByWatchedUser = !!(tweet.inReplyToUsername && tweet.author.username?.toLowerCase() === target.username);
@@ -622,19 +622,17 @@ export class TweetMonitorWorker {
         const stat = fs.statSync(parentScreenshotPath);
         if (stat.size > 0) parentScreenshotResult = parentScreenshotPath;
       }
-      if (!parentScreenshotResult) {
-        failedScreenshots.push({
-          postId: tweet.id,
-          kind: 'parent',
-          username: target.username,
-          captureUsername: tweet.inReplyToTweet.author.username || target.username,
-          captureTweetId: tweet.inReplyToTweet.id,
-          isReply: false,
-          outputPath: parentScreenshotPath,
-          telegramMessageId: null,
-          topicId,
-        });
-      }
+      (parentScreenshotResult ? takenScreenshots : failedScreenshots).push({
+        postId: tweet.id,
+        kind: 'parent',
+        username: target.username,
+        captureUsername: tweet.inReplyToTweet.author.username || target.username,
+        captureTweetId: tweet.inReplyToTweet.id,
+        isReply: false,
+        outputPath: parentScreenshotPath,
+        telegramMessageId: null,
+        topicId,
+      });
     }
 
     const allFiles: string[] = [];
@@ -660,7 +658,7 @@ export class TweetMonitorWorker {
       return false;
     }
     this.trackDelivered([tweet], target, messageId);
-    await this.reportFailedScreenshots(failedScreenshots, messageId, topicId);
+    await this.reportFailedScreenshots(mediaSent ? failedScreenshots : [...failedScreenshots, ...takenScreenshots], messageId, topicId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];
@@ -708,6 +706,8 @@ export class TweetMonitorWorker {
     }
 
     const failedScreenshots: FailedScreenshotInput[] = [];
+    // Taken but not yet sent: these join the retry list if the upload fails.
+    const takenScreenshots: FailedScreenshotInput[] = [];
     const topicId = getTopicId(this.config, target, 'tweet');
     let screenshotResult: string | null = null;
     if (target.saveScreenshots) {
@@ -724,19 +724,17 @@ export class TweetMonitorWorker {
         }
       }
 
-      if (!screenshotResult) {
-        failedScreenshots.push({
-          postId: tweets[0].id,
-          kind: 'thread',
-          username: target.username,
-          captureUsername: target.username,
-          captureTweetId: lastTweet.id,
-          isReply: false,
-          outputPath: screenshotPath,
-          telegramMessageId: null,
-          topicId,
-        });
-      }
+      (screenshotResult ? takenScreenshots : failedScreenshots).push({
+        postId: tweets[0].id,
+        kind: 'thread',
+        username: target.username,
+        captureUsername: target.username,
+        captureTweetId: lastTweet.id,
+        isReply: false,
+        outputPath: screenshotPath,
+        telegramMessageId: null,
+        topicId,
+      });
     }
 
     let parentScreenshotResult: string | null = null;
@@ -751,19 +749,17 @@ export class TweetMonitorWorker {
         const stat = fs.statSync(parentScreenshotPath);
         if (stat.size > 0) parentScreenshotResult = parentScreenshotPath;
       }
-      if (!parentScreenshotResult) {
-        failedScreenshots.push({
-          postId: tweets[0].id,
-          kind: 'parent',
-          username: target.username,
-          captureUsername: tweets[0].inReplyToTweet.author.username || target.username,
-          captureTweetId: tweets[0].inReplyToTweet.id,
-          isReply: false,
-          outputPath: parentScreenshotPath,
-          telegramMessageId: null,
-          topicId,
-        });
-      }
+      (parentScreenshotResult ? takenScreenshots : failedScreenshots).push({
+        postId: tweets[0].id,
+        kind: 'parent',
+        username: target.username,
+        captureUsername: tweets[0].inReplyToTweet.author.username || target.username,
+        captureTweetId: tweets[0].inReplyToTweet.id,
+        isReply: false,
+        outputPath: parentScreenshotPath,
+        telegramMessageId: null,
+        topicId,
+      });
     }
 
     if (parentScreenshotResult) {
@@ -783,7 +779,7 @@ export class TweetMonitorWorker {
       return false;
     }
     this.trackDelivered(tweets, target, messageId);
-    await this.reportFailedScreenshots(failedScreenshots, messageId, topicId);
+    await this.reportFailedScreenshots(mediaSent ? failedScreenshots : [...failedScreenshots, ...takenScreenshots], messageId, topicId);
 
     // Only files that really reached Telegram may be auto-deleted.
     const uploaded = mediaSent ? [...allFiles] : [];

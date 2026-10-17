@@ -46,6 +46,9 @@ interface Sent {
 class RecordingTelegram implements TelegramClient {
   sent: Sent[] = [];
 
+  /** False makes every photo upload fail, as when Telegram stalls. */
+  photosWork = true;
+
   private nextId = 100;
 
   isConfigured(): boolean {
@@ -65,6 +68,7 @@ class RecordingTelegram implements TelegramClient {
     receipt?: TelegramReceipt,
     replyTo?: number | null
   ): Promise<boolean> {
+    if (!this.photosWork) return false;
     this.sent.push({ kind: 'photo', text: caption ?? '', replyTo });
     if (receipt) receipt.messageId = this.nextId++;
     return true;
@@ -240,6 +244,29 @@ describe('failed screenshots', () => {
     storage.close();
   });
 
+  test('a screenshot that was taken but not uploaded is queued, and the retry sends the saved file', async () => {
+    const { storage, telegram, screenshots, retry, worker } = setup(() => [makeTweet('222222', 'hello')]);
+    screenshots.works = true;
+    telegram.photosWork = false;
+
+    await worker.pollOnce();
+
+    const [post, notice] = telegram.sent;
+    expect(post).toMatchObject({ kind: 'message' });
+    expect(post.text).toContain('could not be uploaded');
+    expect(notice.text).toContain('/retry 222222');
+    expect(storage.getFailedScreenshots()).toMatchObject([{ postId: '222222', kind: 'tweet', telegramMessageId: 100 }]);
+
+    // The post may be deleted by now: the retry must not need X again.
+    screenshots.works = false;
+    screenshots.calls = [];
+    telegram.photosWork = true;
+    expect(await retry.retry(['222222'])).toEqual([{ postId: '222222', username: 'alice', ok: true, remaining: 0 }]);
+    expect(screenshots.calls).toEqual([]);
+    expect(telegram.sent.at(-1)).toMatchObject({ kind: 'photo', replyTo: 100 });
+    storage.close();
+  });
+
   test('the list names each post once, with the command to retry it', () => {
     const { storage } = setup();
     storage.recordFailedScreenshots([failure('222222'), failure('222222', { kind: 'parent' })]);
@@ -249,5 +276,47 @@ describe('failed screenshots', () => {
     expect(list).toContain('/retry 222222');
     expect(list).toContain('/retry all');
     storage.close();
+  });
+});
+
+describe('photo uploads that time out', () => {
+  async function client(failures: number) {
+    const { TelegramBotApiClient } = await import('../src/adapters/telegram-client');
+    const dir = makeTempDir('watcher-v2-upload-');
+    const photo = path.join(dir, 'shot.jpg');
+    fs.writeFileSync(photo, 'jpeg');
+    let calls = 0;
+    const http = {
+      post: vi.fn(async () => {
+        calls += 1;
+        if (calls <= failures) {
+          const error: any = new Error('timeout of 30000ms exceeded');
+          error.code = 'ECONNABORTED';
+          throw error;
+        }
+        return { status: 200, data: { ok: true, result: { message_id: 7 } } };
+      }),
+    };
+    return { photo, http, telegram: new TelegramBotApiClient(createTestConfig(dir), http as any) };
+  }
+
+  test('are tried once more', async () => {
+    const { photo, http, telegram } = await client(1);
+    const receipt: TelegramReceipt = {};
+    await expect(telegram.sendPhoto(photo, 'caption', null, receipt)).resolves.toBe(true);
+    expect(http.post).toHaveBeenCalledTimes(2);
+    expect(receipt.messageId).toBe(7);
+  });
+
+  test('give up after the second timeout', async () => {
+    const { photo, http, telegram } = await client(2);
+    await expect(telegram.sendPhoto(photo, 'caption')).resolves.toBe(false);
+    expect(http.post).toHaveBeenCalledTimes(2);
+  });
+
+  test('are not repeated for other uploads', async () => {
+    const { photo, http, telegram } = await client(1);
+    await expect(telegram.sendDocument(photo)).resolves.toBe(false);
+    expect(http.post).toHaveBeenCalledTimes(1);
   });
 });

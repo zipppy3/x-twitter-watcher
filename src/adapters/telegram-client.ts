@@ -26,6 +26,11 @@ function isFallbackCandidate(error: AxiosError): boolean {
   return ['ECONNREFUSED', 'ECONNRESET'].includes(error.code || '');
 }
 
+/** Axios gave up waiting; the request may or may not have reached Telegram. */
+function isTimeout(error: AxiosError): boolean {
+  return ['ECONNABORTED', 'ETIMEDOUT'].includes(error.code || '');
+}
+
 export class TelegramBotApiClient implements TelegramClient {
   private readonly logger = rootLogger.child('telegram');
 
@@ -130,6 +135,8 @@ export class TelegramBotApiClient implements TelegramClient {
       receipt,
       replyToMessageId,
       timeout: 30000,
+      // Photos are small, so a timeout is a stall on the way to Telegram, not a slow upload.
+      retryOnTimeout: true,
     });
   }
 
@@ -267,6 +274,7 @@ export class TelegramBotApiClient implements TelegramClient {
       receipt?: TelegramReceipt;
       replyToMessageId?: number | null;
       timeout: number;
+      retryOnTimeout?: boolean;
       extraFields?: Record<string, string>;
       onFallbackFailure?: (error: AxiosError) => Promise<void>;
     }
@@ -308,15 +316,16 @@ export class TelegramBotApiClient implements TelegramClient {
         maxBodyLength: Infinity,
         timeout: options.timeout,
       });
-    }, options.onFallbackFailure, options.receipt);
+    }, options.onFallbackFailure, options.receipt, options.retryOnTimeout);
   }
 
   private async requestWithFallback<T>(
     request: (baseUrl: string) => Promise<AxiosResponse<T>>,
     onFallbackFailure?: (error: AxiosError) => Promise<void>,
-    receipt?: TelegramReceipt
+    receipt?: TelegramReceipt,
+    retryOnTimeout = false
   ): Promise<boolean> {
-    const delivered = await this.tryRequest(request, onFallbackFailure, receipt);
+    const delivered = await this.tryRequest(request, onFallbackFailure, receipt, retryOnTimeout);
     if (delivered) {
       this.health?.ok('telegram');
     } else {
@@ -329,6 +338,7 @@ export class TelegramBotApiClient implements TelegramClient {
     request: (baseUrl: string) => Promise<AxiosResponse<T>>,
     onFallbackFailure?: (error: AxiosError) => Promise<void>,
     receipt?: TelegramReceipt,
+    retryOnTimeout = false,
     retried = false
   ): Promise<boolean> {
     const succeeded = (response: AxiosResponse<T>): boolean => {
@@ -354,7 +364,13 @@ export class TelegramBotApiClient implements TelegramClient {
         const waitSeconds = Math.min(Math.max(retryAfter, 1), 60);
         this.logger.warn('Telegram rate limit hit, retrying after the requested pause', { waitSeconds });
         await sleep(waitSeconds * 1000 + 500);
-        return this.tryRequest(request, onFallbackFailure, receipt, true);
+        return this.tryRequest(request, onFallbackFailure, receipt, retryOnTimeout, true);
+      }
+      // A rare duplicate beats a post that silently lost its image.
+      if (!retried && retryOnTimeout && isTimeout(axiosError)) {
+        this.logger.warn('Telegram upload timed out, trying once more', { message: axiosError.message });
+        await sleep(2000);
+        return this.tryRequest(request, onFallbackFailure, receipt, retryOnTimeout, true);
       }
       if (this.isLocalServerConfigured && isFallbackCandidate(axiosError)) {
         this.logger.warn('Local Telegram API unavailable, falling back to public API');

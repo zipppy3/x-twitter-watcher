@@ -3,6 +3,14 @@ import { AppConfig, FailedScreenshot, FailedScreenshotInput, ScreenshotService, 
 import { rootLogger } from '../runtime/logger';
 import { buildScreenshotFailedMessage } from './telegram-messages';
 
+function hasContent(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** A failure that was never retried is forgotten after this long. */
 const KEEP_FAILURES_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -115,8 +123,10 @@ export class ScreenshotRetryService {
   private async retryOne(item: FailedScreenshot): Promise<boolean> {
     this.logger.info('Retrying screenshot', { postId: item.postId, kind: item.kind, attempt: item.attempts + 1 });
     try {
-      const path =
-        item.kind === 'thread'
+      // Taken but never uploaded: send what was captured, the post may be gone by now.
+      const path = hasContent(item.outputPath)
+        ? item.outputPath
+        : item.kind === 'thread'
           ? await this.screenshots.captureThread(item.captureUsername, item.captureTweetId, item.outputPath)
           : await this.screenshots.captureTweet(item.captureUsername, item.captureTweetId, item.outputPath, item.isReply);
       if (!path) {

@@ -248,9 +248,9 @@ export function groupFailedByPost(failed: FailedScreenshot[]): Array<{ postId: s
 /** Sent as a reply to the post that went out without its screenshot. */
 export function buildScreenshotFailedMessage(failed: FailedScreenshot[]): string {
   const [post] = groupFailedByPost(failed);
-  const what = post.count > 1 ? `${post.count} screenshots` : 'The screenshot';
+  const what = post.count > 1 ? `${post.count} screenshots are` : 'The screenshot is';
   return [
-    `📸 <b>${what} could not be taken</b> · ${postLink(post.username, post.postId)}`,
+    `📸 <b>${what} missing</b> · ${postLink(post.username, post.postId)}`,
     `Try again: <code>/retry ${post.postId}</code> (or reply to this message with /retry)`,
   ].join('\n');
 }
