@@ -128,6 +128,7 @@ describe('tweet delivery', () => {
 
     await worker.pollOnce();
     expect(telegram.messages).toHaveLength(2); // nothing is sent twice
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
   });
 
@@ -140,6 +141,7 @@ describe('tweet delivery', () => {
     }
 
     expect(storage.getSeenTweetIds('alice')).toContain('2');
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
   });
 
@@ -163,6 +165,7 @@ describe('tweet delivery', () => {
     expect(telegram.messages[0]).toContain('hello');
     expect(telegram.messages[0]).toContain('could not be uploaded');
     expect(storage.getSeenTweetIds('alice')).toContain('2');
+    await worker.stop(); // pollOnce re-arms its timer
     storage.close();
     fs.rmSync(shotDir, { recursive: true, force: true });
   });
