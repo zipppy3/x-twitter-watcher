@@ -80,6 +80,24 @@ export class CamoufoxBrowser {
     return this.launching;
   }
 
+  /**
+   * Throw away a browser that has stopped loading pages; the next `get()` starts
+   * a fresh one. Does nothing when `browser` has already been replaced.
+   */
+  async recycle(browser: Browser, reason: string): Promise<void> {
+    if (this.closed || this.browser !== browser) {
+      return;
+    }
+    this.logger.warn('Restarting Camoufox', { reason });
+    // Detach first, so a `get()` during the shutdown launches a new browser
+    // instead of handing out this one.
+    const server = this.server;
+    this.browser = null;
+    this.server = null;
+    await Promise.race([browser.close().catch(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, 8000))]);
+    this.stopServer(server);
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     if (this.launching) {
@@ -159,9 +177,10 @@ export class CamoufoxBrowser {
     return browser;
   }
 
-  private stopServer(): void {
-    const server = this.server;
-    this.server = null;
+  private stopServer(server: ChildProcess | null = this.server): void {
+    if (server === this.server) {
+      this.server = null;
+    }
     if (!server || server.exitCode !== null || !server.pid) {
       return;
     }

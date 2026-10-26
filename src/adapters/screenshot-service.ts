@@ -8,10 +8,30 @@ import { ProxyRotator } from '../utils/proxy-rotator';
 import { NitterApiClient } from './nitter-client';
 import { CamoufoxBrowser } from './camoufox-browser';
 
+/** After this many failed captures in a row, the browser is replaced by a fresh one. */
+const RECYCLE_AFTER_FAILURES = 2;
+/** At most one browser restart in this window, so a real X outage does not cause a restart loop. */
+const RECYCLE_COOLDOWN_MS = 10 * 60 * 1000;
+
+const TIMED_OUT = Symbol('timed out');
+
+/** What one capture has opened, so a timeout can close it instead of leaving it running. */
+interface CaptureAttempt {
+  browser: any | null;
+  contexts: Set<any>;
+  timedOut: boolean;
+  /** X showed its "Post Not Found" page: the post is gone, the browser is fine. */
+  notFound: boolean;
+}
+
 export class CamoufoxScreenshotService implements ScreenshotService {
   private readonly logger = rootLogger.child('screenshot');
 
   private semaphore = new Semaphore(4);
+
+  private consecutiveFailures = 0;
+
+  private lastRecycleAt = 0;
 
   constructor(
     private readonly config: AppConfig,
@@ -29,14 +49,14 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       ? `${nitterBase}/${username}/status/${tweetId}`
       : `https://x.com/${username}/status/${tweetId}`;
       
-    return this.enqueue(async () => {
+    return this.enqueue(async (attempt) => {
       if (!this.config.proxyFallbackOnBan || !this.proxyRotator?.enabled) {
-        return this.captureUrl(url, outputPath, false, isReply, true);
+        return this.captureUrl(url, outputPath, false, isReply, true, attempt);
       }
-      const result = await this.captureUrl(url, outputPath, false, isReply, false);
-      if (result) return result;
+      const result = await this.captureUrl(url, outputPath, false, isReply, false, attempt);
+      if (result || attempt.notFound || attempt.timedOut) return result;
       this.logger.warn('Screenshot failed without proxy, falling back to proxy...', { url });
-      return this.captureUrl(url, outputPath, false, isReply, true);
+      return this.captureUrl(url, outputPath, false, isReply, true, attempt);
     }, `tweet ${username}/${tweetId}`);
   }
 
@@ -48,14 +68,14 @@ export class CamoufoxScreenshotService implements ScreenshotService {
       ? `${nitterBase}/${username}/status/${tweetId}`
       : `https://x.com/${username}/status/${tweetId}`;
       
-    return this.enqueue(async () => {
+    return this.enqueue(async (attempt) => {
       if (!this.config.proxyFallbackOnBan || !this.proxyRotator?.enabled) {
-        return this.captureUrl(url, outputPath, true, false, true);
+        return this.captureUrl(url, outputPath, true, false, true, attempt);
       }
-      const result = await this.captureUrl(url, outputPath, true, false, false);
-      if (result) return result;
+      const result = await this.captureUrl(url, outputPath, true, false, false, attempt);
+      if (result || attempt.notFound || attempt.timedOut) return result;
       this.logger.warn('Screenshot failed without proxy, falling back to proxy...', { url });
-      return this.captureUrl(url, outputPath, true, false, true);
+      return this.captureUrl(url, outputPath, true, false, true, attempt);
     }, `thread ${username}/${tweetId}`);
   }
 
@@ -63,21 +83,60 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     // The shared Camoufox browser is owned and closed by the daemon.
   }
 
-  private enqueue(task: () => Promise<string | null>, label: string): Promise<string | null> {
+  private enqueue(task: (attempt: CaptureAttempt) => Promise<string | null>, label: string): Promise<string | null> {
     const run = async (): Promise<string | null> => {
       this.logger.info(`Starting screenshot capture: ${label}`);
-      const result = await withTimeout(task(), this.config.screenshotTimeoutMs, null);
+      const attempt: CaptureAttempt = { browser: null, contexts: new Set(), timedOut: false, notFound: false };
+      const outcome = await withTimeout<string | null | typeof TIMED_OUT>(task(attempt), this.config.screenshotTimeoutMs, TIMED_OUT);
+
+      if (outcome === TIMED_OUT) {
+        // Close what the capture opened; left running, it keeps a page busy in the
+        // browser and may still write the file minutes later.
+        attempt.timedOut = true;
+        await withTimeout(
+          Promise.all([...attempt.contexts].map((context) => context.close().catch(() => undefined))),
+          5000,
+          undefined,
+        );
+      }
+
+      const result = outcome === TIMED_OUT ? null : outcome;
       if (result) {
         this.logger.info(`Screenshot captured successfully: ${label}`, { path: result });
+        this.consecutiveFailures = 0;
         this.health?.ok('screenshot');
+      } else if (attempt.notFound) {
+        this.logger.warn(`No screenshot, the post is not on X (deleted or not public): ${label}`);
       } else {
-        this.logger.warn(`Screenshot capture returned null (timeout or error): ${label}`);
+        this.logger.warn(`Screenshot capture ${outcome === TIMED_OUT ? 'timed out' : 'failed'}: ${label}`);
         this.health?.fail('screenshot', `No screenshot for ${label}`);
+        await this.noteBrowserFailure(attempt.browser);
       }
       return result;
     };
 
     return this.semaphore.run(run);
+  }
+
+  /**
+   * A long-running browser can stop loading pages while a fresh one works fine
+   * (seen 2026-10-26 after three days: every page load timed out). Replace it
+   * after a few failures in a row.
+   */
+  private async noteBrowserFailure(browser: any | null): Promise<void> {
+    this.consecutiveFailures += 1;
+    if (!browser || this.consecutiveFailures < RECYCLE_AFTER_FAILURES || Date.now() - this.lastRecycleAt < RECYCLE_COOLDOWN_MS) {
+      return;
+    }
+    this.lastRecycleAt = Date.now();
+    this.consecutiveFailures = 0;
+    await this.camoufox.recycle(browser, `${RECYCLE_AFTER_FAILURES} screenshots in a row failed`);
+  }
+
+  /** X's page for a deleted or unavailable post is titled "Post Not Found - X | 404 Error". */
+  private async showsMissingPost(page: any): Promise<boolean> {
+    const title: string = await withTimeout(page.title().catch(() => ''), 3000, '');
+    return /not found|\b404\b/i.test(title);
   }
 
   private ensureBrowser(): Promise<any | null> {
@@ -152,19 +211,27 @@ export class CamoufoxScreenshotService implements ScreenshotService {
     }
   }
 
-  private async captureUrl(url: string, outputPath: string, fullPage: boolean, isReply: boolean, useProxy: boolean): Promise<string | null> {
+  private async captureUrl(
+    url: string,
+    outputPath: string,
+    fullPage: boolean,
+    isReply: boolean,
+    useProxy: boolean,
+    attempt: CaptureAttempt,
+  ): Promise<string | null> {
     const browser = await this.ensureBrowser();
-    if (!browser) {
+    if (!browser || attempt.timedOut) {
       return null;
     }
+    attempt.browser = browser;
 
     let context: any;
     let page: any;
 
     let proxyConfig: any = null;
+    const isNitter = this.config.dataSource === 'nitter';
 
     try {
-      const isNitter = this.config.dataSource === 'nitter';
       proxyConfig = useProxy && this.proxyRotator?.enabled ? this.proxyRotator.next() : null;
 
       context = await browser.newContext({
@@ -173,6 +240,10 @@ export class CamoufoxScreenshotService implements ScreenshotService {
         locale: 'en-US',
         ...(proxyConfig ? { proxy: proxyConfig } : {}),
       });
+      attempt.contexts.add(context);
+      if (attempt.timedOut) {
+        return null;
+      }
       page = await context.newPage();
 
       // Logged-out visitors get X's newer web app, whose posts are plain <article>
@@ -369,17 +440,24 @@ export class CamoufoxScreenshotService implements ScreenshotService {
 
       return outputPath;
     } catch (error) {
+      if (attempt.timedOut) {
+        // Already reported as a timeout; this is the page being closed under it.
+        return null;
+      }
+      if (!isNitter && page && (await this.showsMissingPost(page))) {
+        attempt.notFound = true;
+        return null;
+      }
       if (proxyConfig && this.proxyRotator) {
         this.proxyRotator.markFailed(proxyConfig.server);
       }
       this.logger.warn('Failed to capture screenshot', { url, message: (error as Error).message });
       return null;
     } finally {
-      if (page) {
-        await page.close().catch(() => undefined);
-      }
       if (context) {
-        await context.close().catch(() => undefined);
+        attempt.contexts.delete(context);
+        // Closing the context closes its page too; bounded so a stuck browser cannot hang this.
+        await withTimeout(context.close().catch(() => undefined), 10000, undefined);
       }
     }
   }
