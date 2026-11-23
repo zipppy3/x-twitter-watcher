@@ -303,6 +303,9 @@ describe('Space stream refused by X', () => {
     watcher.space = { title: 'obese', creator: { username: 'alice' }, state: 'live' };
     const SpaceWatcherBase = Object.getPrototypeOf(RecordingWatcher.prototype);
     vi.spyOn(SpaceWatcherBase, 'getLiveStreamStatus').mockRejectedValue(httpError(404));
+    // The logged-out retry is refused too (a protected host).
+    vi.spyOn(api.liveVideoStream, 'getGuestHeaders').mockResolvedValue({});
+    vi.spyOn(api.liveVideoStream.client, 'get').mockRejectedValue(httpError(404));
     return watcher;
   }
 
@@ -312,7 +315,7 @@ describe('Space stream refused by X', () => {
     }
   }
 
-  test('a protected host the account does not follow ends the job with a reason once the Space is over', async () => {
+  test('a refused stream the logged-out request cannot get either is retried, then failed with a reason once the Space is over', async () => {
     const watcher = refusedWatcher(makeTempDir('space-rec-refused-'));
     const getSpaceData = vi.spyOn(watcher, 'getSpaceData').mockImplementation(async () => undefined);
     vi.spyOn(api.graphql, 'UserByScreenName').mockResolvedValue({
@@ -329,6 +332,7 @@ describe('Space stream refused by X', () => {
     watcher.space.state = 'ended';
     await refuse(watcher, STREAM_RECHECK_EVERY);
     expect(failed).toHaveBeenCalledTimes(1);
+    expect(failed.mock.calls[0][0].reason).toContain("refused this Space's audio to the watcher's logged-in X account");
     expect(failed.mock.calls[0][0].reason).toContain("@alice's account is protected");
     expect(failed.mock.calls[0][0].keptAt).toBeNull();
 
@@ -350,6 +354,22 @@ describe('Space stream refused by X', () => {
     const result = await done;
     expect(result.event).toBe('failed');
     expect(result.payload.reason).toContain('HTTP 404');
+    expect(result.payload.reason).toContain('logged-out request was refused too');
+  });
+
+  test('when X refuses the logged-in request, the logged-out one is used', async () => {
+    const watcher = refusedWatcher(makeTempDir('space-rec-guest-'));
+    const location = 'https://example.invalid/audio-space/dynamic_playlist.m3u8?type=live';
+    (api.liveVideoStream.client.get as any).mockResolvedValue({ data: { source: { location } } });
+    const failed = vi.fn();
+    watcher.on('failed', failed);
+
+    await watcher.getLiveStreamStatus();
+
+    expect(api.liveVideoStream.client.get).toHaveBeenCalledWith('status/k', { headers: {} });
+    expect(watcher.liveStreamStatus.source.location).toBe(location);
+    expect(watcher.streamRefusals).toBe(0);
+    expect(failed).not.toHaveBeenCalled();
   });
 
   test('resuming an ended Space with no replay names the refused stream as the reason', async () => {

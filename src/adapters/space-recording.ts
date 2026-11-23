@@ -26,11 +26,12 @@ const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 /** Leftovers older than this are not picked up again at startup. */
 const RESUME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 /**
- * X answers the stream-status request with 404 when this account may not listen
- * (2026-11-23: the host had made their account protected, and the watcher's
- * account does not follow it). Upstream retries that every 10 s forever, so the
- * Space's state is re-read every this many refusals, and the job ends with a
- * reason once the Space is over.
+ * X can refuse the stream-status request with 404 (2026-11-23: X refused it to
+ * the VPS's logged-in account for every Space, public replays included, while
+ * the same request logged out or from another account worked). The request is
+ * then retried logged out, which works for public hosts but not protected ones.
+ * Upstream retried the refusal every 10 s forever, so the Space's state is
+ * re-read every this many refusals, and the job ends with a reason once it is over.
  */
 export const STREAM_RECHECK_EVERY = 6;
 /** Refusals (about 10 s apart) after which the recording is given up even if X still says live. */
@@ -338,6 +339,8 @@ export class RecordingWatcher extends SpaceWatcher {
   /** Stream-status requests X refused in a row (see STREAM_RECHECK_EVERY). */
   private streamRefusals = 0;
 
+  private warnedLoggedInRefused = false;
+
   constructor(
     spaceId: string,
     private readonly jobs: SpaceJobStore,
@@ -384,7 +387,7 @@ export class RecordingWatcher extends SpaceWatcher {
 
   async getLiveStreamStatus(): Promise<void> {
     try {
-      await super.getLiveStreamStatus();
+      await this.loadStreamStatus();
       this.streamRefusals = 0;
     } catch (error) {
       if (!this.savedPlaylistUrl) {
@@ -395,6 +398,41 @@ export class RecordingWatcher extends SpaceWatcher {
         spaceId: this.spaceId,
         message: (error as Error).message,
       });
+    }
+  }
+
+  /**
+   * Upstream's stream-status request (logged in); when X refuses it, the same
+   * request logged out. That one only works for hosts whose account is public.
+   */
+  private async loadStreamStatus(): Promise<void> {
+    try {
+      await super.getLiveStreamStatus();
+    } catch (error) {
+      const status = httpStatus(error);
+      const mediaKey = this.audioSpace?.metadata?.media_key;
+      if ((status !== 404 && status !== 403) || !mediaKey) {
+        throw error;
+      }
+      let data: unknown;
+      try {
+        const stream = api.liveVideoStream;
+        ({ data } = await stream.client.get(`status/${mediaKey}`, { headers: await stream.getGuestHeaders() }));
+      } catch (guestError) {
+        this.log.debug('The logged-out stream request was refused too', {
+          spaceId: this.spaceId,
+          status: httpStatus(guestError),
+        });
+        throw error;
+      }
+      if (!this.warnedLoggedInRefused) {
+        this.warnedLoggedInRefused = true;
+        this.log.warn("X refused the Space stream to the watcher's logged-in account; using the logged-out request", {
+          spaceId: this.spaceId,
+          status,
+        });
+      }
+      this.liveStreamStatus = data;
     }
   }
 
@@ -425,7 +463,7 @@ export class RecordingWatcher extends SpaceWatcher {
     }
     this.streamRefusals += 1;
     if (this.streamRefusals === 1) {
-      this.log.warn('X refused the Space stream to this account; it cannot be recorded while that lasts', {
+      this.log.warn('X refused the Space stream, logged in and logged out; it cannot be recorded while that lasts', {
         spaceId: this.spaceId,
         status,
       });
@@ -447,23 +485,23 @@ export class RecordingWatcher extends SpaceWatcher {
   }
 
   private async describeStreamRefusal(status: number): Promise<string> {
-    const refused = `X would not give it this Space's audio (HTTP ${status})`;
+    const refused = `X refused this Space's audio to the watcher's logged-in X account (HTTP ${status})`;
     const username = this.space?.creator?.username;
     if (username) {
       try {
         const { data } = await api.graphql.UserByScreenName(username, true);
         const legacy = data?.data?.user?.result?.legacy;
-        if (legacy?.protected && !legacy?.following) {
-          return `@${username}'s account is protected and the watcher's X account does not follow it, so ${refused}`;
-        }
         if (legacy?.blocked_by) {
-          return `@${username} has blocked the watcher's X account, so ${refused}`;
+          return `@${username} has blocked the watcher's X account, so ${refused.charAt(0).toLowerCase()}${refused.slice(1)}`;
+        }
+        if (legacy?.protected) {
+          return `${refused}, and @${username}'s account is protected, so the logged-out request could not get it either. New cookies for that account (update-tokens) or another account are needed`;
         }
       } catch (error) {
         this.log.debug('Could not look up the Space host', { spaceId: this.spaceId, message: (error as Error).message });
       }
     }
-    return `X would not give the watcher's X account this Space's audio (HTTP ${status})`;
+    return `${refused}, and the logged-out request was refused too`;
   }
 
   /** Upstream stopped without a recording: try the replay anyway, then the saved chunks. */
@@ -478,7 +516,7 @@ export class RecordingWatcher extends SpaceWatcher {
     let refusedStatus: number | undefined;
     if (!this.dynamicPlaylistUrl) {
       try {
-        await super.getLiveStreamStatus();
+        await this.loadStreamStatus();
       } catch (error) {
         // The saved playlist url (if any) is used below.
         const status = httpStatus(error);
