@@ -43,24 +43,39 @@ describe('CamoufoxScreenshotService failures', () => {
 
     await expect(service.captureTweet('alice', '1', output)).resolves.toBeNull();
 
-    expect(contexts).toHaveLength(1);
-    expect(contexts[0].close).toHaveBeenCalled();
+    // The capture and its one automatic retry each opened (and closed) a context.
+    expect(contexts).toHaveLength(2);
+    for (const context of contexts) expect(context.close).toHaveBeenCalled();
+    expect(health.fail).toHaveBeenCalledTimes(1);
     expect(health.fail).toHaveBeenCalledWith('screenshot', expect.stringContaining('alice/1'));
+  });
+
+  test('a failed capture is retried once and the retry can succeed', async () => {
+    const { browser } = makeBrowser({});
+    const { service, health, output } = makeService(browser);
+    const capture = vi.spyOn(service as any, 'captureUrl')
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(output);
+
+    await expect(service.captureTweet('alice', '1', output)).resolves.toBe(output);
+
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(health.fail).not.toHaveBeenCalled();
+    expect(health.ok).toHaveBeenCalledWith('screenshot');
   });
 
   test('failures in a row restart the browser once', async () => {
     const { browser } = makeBrowser({ goto: async () => { throw new Error('page.goto: Timeout 30000ms exceeded.'); } });
     const { service, camoufox, output } = makeService(browser);
 
+    // The capture and its retry fail: two failures in a row replace the browser.
     await service.captureTweet('alice', '1', output);
-    expect(camoufox.recycle).not.toHaveBeenCalled();
-    await service.captureTweet('alice', '2', output);
     expect(camoufox.recycle).toHaveBeenCalledTimes(1);
     expect(camoufox.recycle).toHaveBeenCalledWith(browser, expect.any(String));
 
-    // Within the cooldown a further failure does not restart it again.
+    // Within the cooldown further failures do not restart it again.
+    await service.captureTweet('alice', '2', output);
     await service.captureTweet('alice', '3', output);
-    await service.captureTweet('alice', '4', output);
     expect(camoufox.recycle).toHaveBeenCalledTimes(1);
   });
 
@@ -76,5 +91,7 @@ describe('CamoufoxScreenshotService failures', () => {
     }
     expect(health.fail).not.toHaveBeenCalled();
     expect(camoufox.recycle).not.toHaveBeenCalled();
+    // A missing post is not retried: one context per capture.
+    expect(browser.newContext).toHaveBeenCalledTimes(3);
   });
 });

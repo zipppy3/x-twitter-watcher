@@ -2,19 +2,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { AppConfig, HealthReporter, SpacesProvider, SpacesProviderEvents, SpaceRecordedEvent, WatchTarget } from '../types';
+import { RecordingWatcher, SpaceJobStore } from './space-recording';
 import { rootLogger } from '../runtime/logger';
 import { formatDuration } from '../utils/time';
 import { ensureFileDir, sanitizeFilename } from '../utils/files';
 
-// twspace-crawler is intentionally isolated to this adapter.
-const { SpaceWatcher } = require('twspace-crawler/dist/modules/SpaceWatcher');
-const { Util } = require('twspace-crawler/dist/utils/Util');
-const { SpaceState } = require('twspace-crawler/dist/enums/Twitter.enum');
-const { TwitterApi } = require('twspace-crawler/dist/apis/TwitterApi');
+// twspace-crawler is intentionally isolated to this adapter (and space-recording.ts).
+const { SpaceState } = require('twspace-crawler/dist/enums/twitter.enum');
+const { TwitterApi } = require('twspace-crawler/dist/apis/twitter-api');
 const { api } = require('twspace-crawler/dist/api/twitter.api');
 const { TWITTER_PUBLIC_AUTHORIZATION } = require('twspace-crawler/dist/constants/twitter.constant');
 
-type SpaceWatcherInstance = InstanceType<typeof SpaceWatcher>;
+type SpaceWatcherInstance = RecordingWatcher;
 
 function writeSpeakersMetadata(watcher: SpaceWatcherInstance, downloadRoot: string): string | null {
   const username = watcher.space?.creator?.username;
@@ -66,19 +65,40 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
 
   private pollCount = 0;
 
+  private readonly jobs: SpaceJobStore;
+
   constructor(
     private readonly config: AppConfig,
     private readonly refreshAuth?: (reason: string) => Promise<boolean>,
-    private readonly health?: HealthReporter
+    private readonly health?: HealthReporter,
+    /** Where twspace-crawler keeps chunks while downloading (it uses `.tmp` under the working directory). */
+    tmpRoot = path.join(process.cwd(), '.tmp')
   ) {
     super();
+    this.jobs = new SpaceJobStore(tmpRoot);
   }
 
   async start(initialTargets: WatchTarget[]): Promise<void> {
     for (const target of initialTargets.filter((item) => item.watchSpaces)) {
       await this.addUser(target);
     }
+    this.resumeUnfinished();
     this.schedulePoll(0);
+  }
+
+  /**
+   * Picks up Spaces an earlier run was still recording or downloading when it
+   * stopped (2026-10-27: an unattended upgrade restarted the service mid-download
+   * and the Space was never finished). A Space that is still live just carries on.
+   */
+  private resumeUnfinished(): void {
+    for (const spaceId of this.jobs.pending()) {
+      if (this.activeWatchers.has(spaceId)) {
+        continue;
+      }
+      this.logger.info('Resuming a Space recording left unfinished by an earlier run', { spaceId });
+      this.startWatcher(spaceId);
+    }
   }
 
   async stop(): Promise<void> {
@@ -193,7 +213,10 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
         user: liveSpace.creator?.username || 'unknown',
         startedAt: new Date(liveSpace.started_at || Date.now()).toISOString(),
       });
-      this.startWatcher(liveSpace.id);
+      this.startWatcher(liveSpace.id, {
+        user: liveSpace.creator?.username || 'unknown',
+        title: liveSpace.title || 'Untitled Space',
+      });
     }
   }
 
@@ -213,13 +236,19 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
         authorization: TWITTER_PUBLIC_AUTHORIZATION,
         cookie: `auth_token=${authToken}`,
       });
-      return Object.values(data.users || {})
-        .map((item: any) => item.spaces?.live_content?.audiospace)
-        .filter(Boolean)
-        .map((item: any) => ({
+      // The response is keyed by user id and does not always carry
+      // owner_screen_name (the "Space is live" notice then said "Host: @unknown").
+      const usernameById = new Map<string, string>();
+      for (const [username, userId] of this.watchedUsers) {
+        if (userId) usernameById.set(userId, username);
+      }
+      return Object.entries(data.users || {})
+        .map(([userId, item]: [string, any]) => ({ userId, space: item?.spaces?.live_content?.audiospace }))
+        .filter(({ space }) => Boolean(space))
+        .map(({ userId, space: item }: { userId: string; space: any }) => ({
           id: item.broadcast_id,
           title: item.title,
-          creator: { username: item.owner_screen_name },
+          creator: { username: item.owner_screen_name || usernameById.get(userId) },
           started_at: item.start,
           state: SpaceState.LIVE,
         }));
@@ -241,24 +270,63 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
     }
   }
 
-  private startWatcher(spaceId: string): void {
-    const watcher = new SpaceWatcher(spaceId) as SpaceWatcherInstance;
+  private startWatcher(spaceId: string, live?: { user: string; title: string }): void {
+    const watcher = new RecordingWatcher(spaceId, this.jobs, this.logger);
     this.activeWatchers.set(spaceId, watcher);
-    watcher.watch();
+    try {
+      this.jobs.update({ spaceId, user: live?.user ?? null, title: live?.title ?? null });
+    } catch (error) {
+      this.logger.warn('Could not save the Space job file', { spaceId, message: (error as Error).message });
+    }
+
+    const settle = (failed = false): void => {
+      this.activeWatchers.delete(spaceId);
+      if (failed) {
+        this.jobs.markFailed(spaceId);
+      } else {
+        this.jobs.remove(spaceId);
+      }
+    };
 
     watcher.once('complete', () => {
-      this.activeWatchers.delete(spaceId);
+      settle();
       const event = this.buildRecordedEvent(spaceId, watcher);
       if (event) {
         this.emit('recorded', event);
+      } else {
+        this.jobs.markFailed(spaceId);
+        this.emit('failed', {
+          ...this.describe(spaceId, watcher, live),
+          reason: 'the download finished without an audio file',
+          keptAt: null,
+        });
       }
     });
+    watcher.once('failed', ({ reason, keptAt }: { reason: string; keptAt: string | null }) => {
+      settle(true);
+      this.logger.error('Space recording failed', { spaceId, reason, keptAt });
+      this.emit('failed', { ...this.describe(spaceId, watcher, live), reason, keptAt });
+    });
+    watcher.once('dropped', () => {
+      settle();
+      this.logger.info('Space was cancelled; nothing to record', { spaceId });
+    });
+
+    watcher.watch();
+  }
+
+  private describe(spaceId: string, watcher: SpaceWatcherInstance, live?: { user: string; title: string }) {
+    return {
+      spaceId,
+      title: watcher.space?.title || live?.title || 'Untitled Space',
+      user: watcher.space?.creator?.username || live?.user || 'unknown',
+    };
   }
 
   private buildRecordedEvent(spaceId: string, watcher: SpaceWatcherInstance): SpaceRecordedEvent | null {
     const originalFilePath = watcher.downloader?.resultFile;
     const username = watcher.space?.creator?.username || 'unknown';
-    if (!originalFilePath) {
+    if (!originalFilePath || !fs.existsSync(originalFilePath)) {
       return null;
     }
 
@@ -296,6 +364,15 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
       filePath: finalFilePath,
       metadataPath,
       recordedAt: new Date().toISOString(),
+      ...this.describeOutcome(watcher),
+    };
+  }
+
+  private describeOutcome(watcher: SpaceWatcherInstance): Pick<SpaceRecordedEvent, 'missingSeconds' | 'builtFromSavedChunks'> {
+    const { gaps, fallbackReason } = watcher.outcome;
+    return {
+      ...(gaps?.missing ? { missingSeconds: Math.round(gaps.missingSeconds) } : {}),
+      ...(fallbackReason ? { builtFromSavedChunks: fallbackReason } : {}),
     };
   }
 
@@ -316,6 +393,7 @@ export class TwspaceSpacesProvider extends EventEmitter implements SpacesProvide
       filePath,
       metadataPath,
       recordedAt: new Date().toISOString(),
+      ...this.describeOutcome(watcher),
     };
   }
 }

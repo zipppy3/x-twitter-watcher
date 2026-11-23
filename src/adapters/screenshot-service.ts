@@ -3,7 +3,7 @@ import path from 'node:path';
 import { AppConfig, HealthReporter, ScreenshotService } from '../types';
 import { rootLogger } from '../runtime/logger';
 import { ensureFileDir } from '../utils/files';
-import { withTimeout, Semaphore } from '../utils/async';
+import { withTimeout, Semaphore, sleep } from '../utils/async';
 import { ProxyRotator } from '../utils/proxy-rotator';
 import { NitterApiClient } from './nitter-client';
 import { CamoufoxBrowser } from './camoufox-browser';
@@ -12,6 +12,8 @@ import { CamoufoxBrowser } from './camoufox-browser';
 const RECYCLE_AFTER_FAILURES = 2;
 /** At most one browser restart in this window, so a real X outage does not cause a restart loop. */
 const RECYCLE_COOLDOWN_MS = 10 * 60 * 1000;
+/** A failed capture is tried once more before the post goes out without it. */
+const CAPTURE_ATTEMPTS = 2;
 
 const TIMED_OUT = Symbol('timed out');
 
@@ -85,34 +87,47 @@ export class CamoufoxScreenshotService implements ScreenshotService {
 
   private enqueue(task: (attempt: CaptureAttempt) => Promise<string | null>, label: string): Promise<string | null> {
     const run = async (): Promise<string | null> => {
-      this.logger.info(`Starting screenshot capture: ${label}`);
-      const attempt: CaptureAttempt = { browser: null, contexts: new Set(), timedOut: false, notFound: false };
-      const outcome = await withTimeout<string | null | typeof TIMED_OUT>(task(attempt), this.config.screenshotTimeoutMs, TIMED_OUT);
+      for (let attemptNo = 1; attemptNo <= CAPTURE_ATTEMPTS; attemptNo += 1) {
+        const isLast = attemptNo === CAPTURE_ATTEMPTS;
+        this.logger.info(`Starting screenshot capture${attemptNo > 1 ? ` (retry ${attemptNo - 1})` : ''}: ${label}`);
+        const attempt: CaptureAttempt = { browser: null, contexts: new Set(), timedOut: false, notFound: false };
+        const outcome = await withTimeout<string | null | typeof TIMED_OUT>(task(attempt), this.config.screenshotTimeoutMs, TIMED_OUT);
 
-      if (outcome === TIMED_OUT) {
-        // Close what the capture opened; left running, it keeps a page busy in the
-        // browser and may still write the file minutes later.
-        attempt.timedOut = true;
-        await withTimeout(
-          Promise.all([...attempt.contexts].map((context) => context.close().catch(() => undefined))),
-          5000,
-          undefined,
-        );
-      }
+        if (outcome === TIMED_OUT) {
+          // Close what the capture opened; left running, it keeps a page busy in the
+          // browser and may still write the file minutes later.
+          attempt.timedOut = true;
+          await withTimeout(
+            Promise.all([...attempt.contexts].map((context) => context.close().catch(() => undefined))),
+            5000,
+            undefined,
+          );
+        }
 
-      const result = outcome === TIMED_OUT ? null : outcome;
-      if (result) {
-        this.logger.info(`Screenshot captured successfully: ${label}`, { path: result });
-        this.consecutiveFailures = 0;
-        this.health?.ok('screenshot');
-      } else if (attempt.notFound) {
-        this.logger.warn(`No screenshot, the post is not on X (deleted or not public): ${label}`);
-      } else {
-        this.logger.warn(`Screenshot capture ${outcome === TIMED_OUT ? 'timed out' : 'failed'}: ${label}`);
-        this.health?.fail('screenshot', `No screenshot for ${label}`);
+        const result = outcome === TIMED_OUT ? null : outcome;
+        if (result) {
+          this.logger.info(`Screenshot captured successfully: ${label}`, { path: result });
+          this.consecutiveFailures = 0;
+          this.health?.ok('screenshot');
+          return result;
+        }
+        if (attempt.notFound) {
+          // A missing post stays missing; retrying would only load the same page again.
+          this.logger.warn(`No screenshot, the post is not on X (deleted or not public): ${label}`);
+          return null;
+        }
+
+        const how = outcome === TIMED_OUT ? 'timed out' : 'failed';
+        this.logger.warn(`Screenshot capture ${how}${isLast ? '' : ', retrying once'}: ${label}`);
+        // Counted on every attempt, so a second failure in a row gets the retry a fresh browser.
         await this.noteBrowserFailure(attempt.browser);
+        if (isLast) {
+          this.health?.fail('screenshot', `No screenshot for ${label}`);
+        } else {
+          await sleep(this.config.screenshotRetryDelayMs);
+        }
       }
-      return result;
+      return null;
     };
 
     return this.semaphore.run(run);

@@ -45,6 +45,7 @@ export function createTestConfig(baseDir: string): AppConfig {
     tweetPollIntervalsMs: [10, 20],
     tweetBootstrapDelayMs: 1,
     screenshotTimeoutMs: 100,
+    screenshotRetryDelayMs: 1,
     watchlistReloadIntervalMs: 10,
     spacePollIntervalMs: 10,
   };

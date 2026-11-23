@@ -1,4 +1,4 @@
-import { DeliveredTweet, FailedScreenshot, SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
+import { DeliveredTweet, FailedScreenshot, SpaceFailedEvent, SpaceLiveEvent, SpaceRecordedEvent, Tweet } from '../types';
 import { escapeHtml } from '../utils/html';
 
 /**
@@ -194,14 +194,44 @@ export function buildSpaceLiveMessage(event: SpaceLiveEvent): string {
 
 export function buildSpaceRecordedMessage(event: SpaceRecordedEvent): string {
   const fileName = event.filePath.split(/[\\/]/).pop() || event.filePath;
-  return [
+  const lines = [
     '✅ <b>Space recorded</b>',
     '',
     `🎙 <b>${escapeHtml(event.title)}</b>`,
     `👤 Host: @${escapeHtml(event.user)}`,
     `⏱ Duration: ${escapeHtml(event.duration)}`,
     `💾 <code>${escapeHtml(fileName)}</code>`,
-  ].join('\n');
+  ];
+  if (event.missingSeconds) {
+    lines.push(`⚠️ About ${formatSeconds(event.missingSeconds)} of audio is missing (X no longer had it).`);
+  }
+  if (event.builtFromSavedChunks) {
+    lines.push(`ℹ️ Built from the audio saved on the server: ${escapeHtml(event.builtFromSavedChunks)}.`);
+  }
+  return lines.join('\n');
+}
+
+function formatSeconds(total: number): string {
+  if (total < 60) {
+    return `${total} s`;
+  }
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes} min ${seconds} s` : `${minutes} min`;
+}
+
+export function buildSpaceRecordingFailedMessage(event: SpaceFailedEvent): string {
+  const lines = [
+    '❌ <b>Space recording failed</b>',
+    '',
+    `🎙 <b>${escapeHtml(event.title)}</b> (@${escapeHtml(event.user)})`,
+    `🔗 <a href="https://x.com/i/spaces/${encodeURIComponent(event.spaceId)}">Space on X</a>`,
+    `Reason: ${escapeHtml(event.reason)}`,
+  ];
+  if (event.keptAt) {
+    lines.push('The downloaded audio was kept on the server:', `<code>${escapeHtml(event.keptAt)}</code>`);
+  }
+  return lines.join('\n');
 }
 
 export function buildSpaceUploadFailedMessage(event: SpaceRecordedEvent): string {

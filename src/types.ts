@@ -47,6 +47,8 @@ export interface AppConfig {
   tweetPollIntervalsMs: [number, number];
   tweetBootstrapDelayMs: number;
   screenshotTimeoutMs: number;
+  /** Pause before the one automatic retry of a failed screenshot. */
+  screenshotRetryDelayMs: number;
   watchlistReloadIntervalMs: number;
   spacePollIntervalMs: number;
 }
@@ -269,6 +271,19 @@ export interface SpaceRecordedEvent {
   filePath: string;
   metadataPath: string | null;
   recordedAt: string;
+  /** Audio X no longer served, left out of the file. */
+  missingSeconds?: number;
+  /** Set when the file was built from chunks saved on the server instead of X's replay. */
+  builtFromSavedChunks?: string;
+}
+
+export interface SpaceFailedEvent {
+  spaceId: string;
+  title: string;
+  user: string;
+  reason: string;
+  /** Folder on the server that still holds the downloaded chunks, if any. */
+  keptAt: string | null;
 }
 
 export interface SpacePollEvent {
@@ -281,6 +296,7 @@ export interface SpacesProviderEvents {
   poll: SpacePollEvent;
   live: SpaceLiveEvent;
   recorded: SpaceRecordedEvent;
+  failed: SpaceFailedEvent;
   error: Error;
 }
 

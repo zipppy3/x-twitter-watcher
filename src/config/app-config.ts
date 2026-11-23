@@ -96,6 +96,7 @@ export function loadAppConfig(options: AppConfigOptions = {}): AppConfig {
     tweetPollIntervalsMs: [60000, 120000],
     tweetBootstrapDelayMs: 5000,
     screenshotTimeoutMs: 60000,
+    screenshotRetryDelayMs: 5000,
     watchlistReloadIntervalMs: 5000,
     spacePollIntervalMs: 30000,
   };

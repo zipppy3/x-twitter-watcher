@@ -5,6 +5,7 @@ import { getTopicId } from '../services/topic-routing';
 import {
   buildSpaceLiveMessage,
   buildSpaceRecordedMessage,
+  buildSpaceRecordingFailedMessage,
   buildSpaceUploadFailedMessage,
 } from '../services/telegram-messages';
 
@@ -104,6 +105,16 @@ export class SpaceMonitorWorker {
       }
 
       this.autoDeleteFiles(uploadedFiles, true);
+    });
+    this.spacesProvider.on('failed', async (event) => {
+      const state = this.storage.getRuntimeState();
+      const nextActiveSpaces = state.activeSpaces.filter((space) => space.id !== event.spaceId);
+      this.storage.updateRuntimeState({
+        status: nextActiveSpaces.length ? 'recording' : 'watching',
+        activeSpaces: nextActiveSpaces,
+        lastError: `Space ${event.spaceId}: ${event.reason}`,
+      });
+      await this.telegramClient.sendMessage(buildSpaceRecordingFailedMessage(event));
     });
     this.spacesProvider.on('error', (error) => {
       this.logger.error('Spaces provider error', { message: error.message });
